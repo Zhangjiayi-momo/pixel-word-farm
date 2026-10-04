@@ -1,0 +1,1826 @@
+﻿(function () {
+  "use strict";
+
+  const SEED_WORDS = window.WORD_DATA || [];
+  const UPLOAD_KEY = "wordMemoryCoach.uploadedWords.v3";
+  const PROGRESS_KEY = "wordMemoryCoach.progress.v3";
+  const OFFLINE_KEY = "wordMemoryCoach.offlineRoom.v3";
+  const COVER_KEY = "wordMemoryCoach.coverImage.v1";
+  const MODULES = {
+    read: { phase: 1, title: "读音浇灌", eyebrow: "READ ALOUD" },
+    understand: { phase: 2, title: "理解施肥", eyebrow: "UNDERSTAND" },
+    spell: { phase: 3, title: "默写收获", eyebrow: "SPELLING" }
+  };
+
+  const dom = {};
+  const session = {
+    role: "teacher",
+    name: "张老师",
+    room: "WORD-1800",
+    clientId: getClientId(),
+    view: "read",
+    pendingModule: "read",
+    joined: false,
+    connected: false,
+    offline: false,
+    state: null,
+    pollingTimer: null,
+    readTimer: null,
+    activeTool: "pointer",
+    activeColor: "#b83b35",
+    currentStroke: null,
+    readQueueRunning: false,
+    activeAudio: null,
+    erasing: false,
+    erasedStrokeIds: new Set(),
+    lastRenderedWordId: null,
+    selectedSpellIds: new Set(),
+    previewTask: null,
+    teacherShowAnswer: false,
+    progress: readJson(PROGRESS_KEY, {})
+  };
+
+  function getClientId() {
+    const key = "wordMemoryCoach.clientId.v3";
+    let clientId = "";
+    try { clientId = localStorage.getItem(key) || ""; } catch (error) { console.warn(error); }
+    if (!clientId) {
+      clientId = window.crypto && window.crypto.randomUUID
+        ? window.crypto.randomUUID()
+        : `client-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      try { localStorage.setItem(key, clientId); } catch (error) { console.warn(error); }
+    }
+    return clientId;
+  }
+
+  function readJson(key, fallback) {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : fallback;
+    } catch (error) {
+      console.warn("读取本地数据失败", error);
+      return fallback;
+    }
+  }
+
+  function writeJson(key, value) {
+    try { localStorage.setItem(key, JSON.stringify(value)); } catch (error) { console.warn(error); }
+  }
+
+  function escapeHtml(value) {
+    return String(value ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  function cacheDom() {
+    [
+      "homeScreen", "appRoot", "coverImage", "coverImageInput", "uploadCoverButton",
+      "resetCoverButton", "homeConnectionButton", "homeSessionLabel", "homeButton",
+      "connectionStatus", "roomLabel", "copyInviteButton", "uploadButton", "leaveButton",
+      "joinDialog", "roomInput", "nameInput", "joinButton", "uploadDialog", "wordFileInput",
+      "uploadText", "uploadPreview", "autoEnrich", "cancelUpload", "confirmUpload", "dayNav", "dayWordList",
+      "dailyPendingCount", "weekProgressText", "wordListCount", "wordBankLabel", "enrichCurrentWordsButton", "wordBankSelect", "loadWordBankButton",
+      "activeDayLabel", "moduleEyebrow", "moduleTitle", "wordPosition", "studentCount",
+      "readView", "readWordGrid", "readQueueButton", "previousWord", "nextWord",
+      "understandView", "understandingList", "spellView", "spellSelectedCount",
+      "selectAllSpell", "invertSpellSelection", "clearSpellSelection", "spellWordChecklist",
+      "spellTaskType", "generateSpellTask", "publishSpellTask", "spellTaskTitle",
+      "spellTaskCount", "spellTaskList", "submitSpellTask", "toggleTeacherAnswer",
+      "toggleStudentAnswer", "studentTaskResult", "answerKeyPanel", "toolBar", "colorBar",
+      "clearStrokes", "submissionCounter", "studentSubmissions", "pageAnnotationCanvas"
+    ].forEach((id) => { dom[id] = document.getElementById(id); });
+  }
+
+  function bindEvents() {
+    document.querySelectorAll("[data-module]").forEach((button) => {
+      button.addEventListener("click", () => requestModule(button.dataset.module));
+    });
+    dom.homeConnectionButton.addEventListener("click", () => openJoinDialog("read"));
+    dom.uploadCoverButton.addEventListener("click", () => dom.coverImageInput.click());
+    dom.coverImageInput.addEventListener("change", handleCoverImage);
+    dom.resetCoverButton.addEventListener("click", resetCoverImage);
+    dom.homeButton.addEventListener("click", showHome);
+    document.querySelectorAll(".role-card").forEach((button) => {
+      button.addEventListener("click", () => {
+        session.role = button.dataset.role;
+        document.querySelectorAll(".role-card").forEach((item) => item.classList.toggle("is-active", item === button));
+        dom.nameInput.value = session.role === "teacher" ? "张老师" : "学生";
+      });
+    });
+    dom.joinButton.addEventListener("click", joinClassroom);
+    dom.leaveButton.addEventListener("click", leaveClassroom);
+    dom.dayNav.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-day]");
+      if (button) selectDay(Number(button.dataset.day));
+    });
+    dom.loadWordBankButton.addEventListener("click", loadSelectedWordBank);
+    dom.dayWordList.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-word-id]");
+      if (button) selectWord(button.dataset.wordId);
+    });
+    dom.readWordGrid.addEventListener("click", handleReadGridClick);
+    dom.readQueueButton.addEventListener("click", toggleReadQueue);
+    dom.previousWord.addEventListener("click", () => moveWord(-1));
+    dom.nextWord.addEventListener("click", () => moveWord(1));
+    dom.selectAllSpell.addEventListener("click", () => setAllSpellSelection(true));
+    dom.invertSpellSelection.addEventListener("click", invertSpellSelection);
+    dom.clearSpellSelection.addEventListener("click", () => setAllSpellSelection(false));
+    dom.spellWordChecklist.addEventListener("change", handleSpellCheckChange);
+    dom.generateSpellTask.addEventListener("click", () => generateSpellTask(false));
+    dom.publishSpellTask.addEventListener("click", () => generateSpellTask(true));
+    dom.spellTaskList.addEventListener("click", handleSpellTaskListClick);
+    dom.submitSpellTask.addEventListener("click", submitSpellTask);
+    dom.toggleTeacherAnswer.addEventListener("click", toggleTeacherAnswer);
+    dom.toggleStudentAnswer.addEventListener("click", toggleStudentAnswer);
+    dom.copyInviteButton.addEventListener("click", copyInvite);
+    dom.enrichCurrentWordsButton.addEventListener("click", enrichCurrentWordBank);
+    dom.uploadButton.addEventListener("click", () => dom.uploadDialog.showModal());
+    dom.cancelUpload.addEventListener("click", () => dom.uploadDialog.close());
+    dom.confirmUpload.addEventListener("click", confirmUpload);
+    dom.wordFileInput.addEventListener("change", loadWordFile);
+    dom.uploadText.addEventListener("input", updateUploadPreview);
+    dom.toolBar.addEventListener("click", handleToolClick);
+    dom.colorBar.addEventListener("click", handleColorClick);
+    dom.clearStrokes.addEventListener("click", clearStrokes);
+    dom.studentSubmissions.addEventListener("click", handleFeedbackClick);
+    dom.pageAnnotationCanvas.addEventListener("pointerdown", startStroke);
+    dom.pageAnnotationCanvas.addEventListener("pointermove", extendStroke);
+    dom.pageAnnotationCanvas.addEventListener("pointerup", finishStroke);
+    dom.pageAnnotationCanvas.addEventListener("pointercancel", finishStroke);
+    window.addEventListener("resize", resizeCanvas);
+    document.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      session.activeTool = "pointer";
+      document.querySelectorAll("[data-tool]").forEach((item) => item.classList.remove("is-active"));
+      updateCanvasMode();
+    });
+    window.addEventListener("beforeunload", () => {
+      if (session.pollingTimer) clearInterval(session.pollingTimer);
+      if (session.readTimer) clearInterval(session.readTimer);
+    });
+  }
+
+  function handleCoverImage(event) {
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      alert("请选择图片文件。");
+      return;
+    }
+    if (file.size > 12 * 1024 * 1024) {
+      alert("封面图片请控制在 12MB 以内。");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const image = new Image();
+      image.onload = () => {
+        const maxWidth = 2400;
+        const scale = Math.min(1, maxWidth / image.width);
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(image.width * scale));
+        canvas.height = Math.max(1, Math.round(image.height * scale));
+        const context = canvas.getContext("2d");
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        const dataUrl = canvas.toDataURL("image/jpeg", 0.88);
+        try {
+          localStorage.setItem(COVER_KEY, dataUrl);
+          dom.coverImage.src = dataUrl;
+        } catch (error) {
+          alert("图片压缩后仍无法保存，请换一张尺寸更小的图片。");
+        }
+        event.target.value = "";
+      };
+      image.onerror = () => alert("图片读取失败，请更换文件。");
+      image.src = String(reader.result);
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function resetCoverImage() {
+    try { localStorage.removeItem(COVER_KEY); } catch (error) { console.warn(error); }
+    dom.coverImage.src = "assets/farm-cover.png";
+  }
+
+  function applySavedCover() {
+    try {
+      const saved = localStorage.getItem(COVER_KEY);
+      if (saved) dom.coverImage.src = saved;
+    } catch (error) {
+      console.warn(error);
+    }
+  }
+  function openJoinDialog(moduleName) {
+    session.pendingModule = moduleName || "read";
+    dom.joinDialog.showModal();
+  }
+
+  async function requestModule(moduleName) {
+    if (!MODULES[moduleName]) return;
+    session.pendingModule = moduleName;
+    if (!session.joined) {
+      openJoinDialog(moduleName);
+      return;
+    }
+    if (session.role === "student") {
+      enterModule(moduleName);
+      return;
+    }
+    await performAction("setPhase", { phase: MODULES[moduleName].phase });
+    enterModule(moduleName);
+  }
+
+  async function joinClassroom() {
+    session.room = dom.roomInput.value.trim().toUpperCase() || "WORD-1800";
+    session.name = dom.nameInput.value.trim() || (session.role === "teacher" ? "张老师" : "学生");
+    document.body.classList.toggle("role-student", session.role === "student");
+    document.body.classList.toggle("role-teacher", session.role === "teacher");
+    dom.roomLabel.textContent = session.room;
+
+    try {
+      if (location.protocol === "file:") activateOfflineMode();
+      else await joinOnlineRoom();
+    } catch (error) {
+      console.warn("在线同步不可用，切换单机模式", error);
+      activateOfflineMode();
+    }
+
+    session.joined = true;
+    dom.joinDialog.close();
+    dom.homeSessionLabel.textContent = `${session.role === "teacher" ? "教师" : "学生"} · ${session.room}`;
+    if (session.role === "teacher") {
+      await performAction("setPhase", { phase: MODULES[session.pendingModule].phase });
+    }
+    const initialModule = session.pendingModule || phaseToModule(Number(session.state.phase));
+    enterModule(initialModule);
+    startPolling();
+    updateHistory();
+  }
+
+  async function joinOnlineRoom() {
+    session.state = await requestState();
+    session.offline = false;
+    session.connected = true;
+    setConnectionStatus("在线同步", true);
+    await sendAction("join", { name: session.name }, false);
+  }
+
+  function activateOfflineMode() {
+    session.offline = true;
+    session.connected = false;
+    setConnectionStatus("单机模式", false);
+    session.state = readJson(OFFLINE_KEY, null) || createOfflineState();
+    if (!session.state.words || !session.state.words.length) session.state.words = loadLocalWords();
+  }
+
+  function createOfflineState() {
+    const words = loadLocalWords();
+    return {
+      roomId: session.room, version: 0, phase: 1,
+      activeDay: words[0] ? words[0].day : 1,
+      activeWordId: words[0] ? words[0].id : null,
+      words, strokes: {}, students: {}, batchName: "种子词库",
+      batchDate: new Date().toISOString().slice(0, 10),
+      newWordIds: words.map((word) => word.id),
+      spellTask: null, showSpellAnswers: false,
+      activeBankId: "seed",
+      wordBanks: [{ id: "seed", name: "种子词库", date: new Date().toISOString().slice(0, 10), words }]
+    };
+  }
+
+  function loadLocalWords() {
+    const uploaded = readJson(UPLOAD_KEY, null);
+    return Array.isArray(uploaded) && uploaded.length ? uploaded : SEED_WORDS;
+  }
+
+  function updateHistory() {
+    try {
+      const params = new URLSearchParams();
+      params.set("room", session.room);
+      params.set("role", session.role);
+      params.set("module", session.view);
+      history.replaceState(null, "", `${location.pathname}?${params.toString()}`);
+    } catch (error) {
+      console.warn(error);
+    }
+  }
+
+  function showHome() {
+    session.view = "home";
+    stopReadQueue();
+    updateCanvasMode();
+    dom.appRoot.classList.add("is-hidden");
+    dom.homeScreen.classList.remove("is-hidden");
+    dom.homeSessionLabel.textContent = session.joined
+      ? `${session.role === "teacher" ? "教师" : "学生"} · ${session.room}`
+      : "尚未连接课堂";
+    updateHistory();
+  }
+
+  function enterModule(moduleName) {
+    if (!session.joined || !MODULES[moduleName]) return;
+    session.view = moduleName;
+    dom.homeScreen.classList.add("is-hidden");
+    dom.appRoot.classList.remove("is-hidden");
+    document.body.classList.remove("module-read", "module-understand", "module-spell");
+    document.body.classList.add(`module-${moduleName}`);
+    dom.readView.classList.toggle("is-hidden", moduleName !== "read");
+    dom.understandView.classList.toggle("is-hidden", moduleName !== "understand");
+    dom.spellView.classList.toggle("is-hidden", moduleName !== "spell");
+    document.querySelectorAll(".module-button").forEach((button) => {
+      button.classList.toggle("is-active", button.dataset.module === moduleName);
+      button.disabled = false;
+    });
+    dom.homeButton.classList.toggle("is-hidden", session.role === "student");
+    const meta = MODULES[moduleName];
+    dom.moduleEyebrow.textContent = `${meta.eyebrow} · ${session.room}`;
+    dom.moduleTitle.textContent = meta.title;
+    renderAll();
+    requestAnimationFrame(resizeCanvas);
+    updateHistory();
+  }
+
+  function phaseToModule(phase) {
+    return Object.keys(MODULES).find((key) => MODULES[key].phase === Number(phase)) || "read";
+  }
+
+  function startPolling() {
+    if (session.offline || session.pollingTimer) return;
+    session.pollingTimer = setInterval(refreshState, 750);
+  }
+
+  async function refreshState() {
+    if (session.offline || !session.joined) return;
+    try {
+      const state = await requestState();
+      const changed = !session.state || state.version !== session.state.version;
+      session.state = state;
+      session.connected = true;
+      setConnectionStatus("在线同步", true);
+      if (changed) {
+        renderAll();
+      }
+    } catch (error) {
+      session.connected = false;
+      setConnectionStatus("同步中断", false);
+    }
+  }
+
+  async function requestState() {
+    const response = await fetch(`/api/state?room=${encodeURIComponent(session.room)}`, { cache: "no-store" });
+    if (!response.ok) throw new Error(`状态请求失败：${response.status}`);
+    return response.json();
+  }
+
+  async function sendAction(action, payload, rerender = true) {
+    if (session.offline) {
+      applyOfflineAction(action, payload);
+      if (rerender) renderAll();
+      return { ok: true };
+    }
+    const response = await fetch("/api/action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ room: session.room, role: session.role, clientId: session.clientId, action, payload: payload || {} })
+    });
+    const result = await response.json();
+    if (!response.ok || !result.ok) throw new Error(result.error || "操作失败");
+    session.state = result.state;
+    if (rerender) renderAll();
+    return result;
+  }
+
+  function applyOfflineAction(action, payload) {
+    const state = session.state;
+    if (action === "join") return;
+    if (action === "setPhase") state.phase = Number(payload.phase) || 1;
+    if (action === "setWord") state.activeWordId = payload.wordId;
+    if (action === "setDay") state.activeDay = Number(payload.day) || 1;
+    if (action === "addStroke") {
+      const key = payload.strokeKey || annotationKey();
+      state.strokes[key] = state.strokes[key] || [];
+      state.strokes[key].push(payload.stroke);
+    }
+    if (action === "clearStrokes") state.strokes[payload.strokeKey || annotationKey()] = [];
+    if (action === "eraseStrokes") {
+      const key = payload.strokeKey || annotationKey();
+      const ids = new Set(payload.strokeIds || []);
+      state.strokes[key] = (state.strokes[key] || []).filter((stroke) => !ids.has(String(stroke.id)));
+    }
+    if (action === "replaceWords") {
+      state.words = payload.words;
+      state.activeWordId = state.words[0] ? state.words[0].id : null;
+      state.activeDay = state.words[0] ? state.words[0].day : 1;
+      state.strokes = {};
+      state.batchName = payload.batchName || "导入词库";
+      state.batchDate = new Date().toISOString().slice(0, 10);
+      state.newWordIds = state.words.map((word) => word.id);
+      state.spellTask = null;
+      state.showSpellAnswers = false;
+      state.wordBanks = state.wordBanks || [];
+      if (payload.recordBank !== false) {
+        const bankId = `bank-${Date.now()}`;
+        state.wordBanks.push({ id: bankId, name: state.batchName, date: state.batchDate, words: structuredClone(state.words) });
+        state.wordBanks = state.wordBanks.slice(-50);
+        state.activeBankId = bankId;
+      }
+      writeJson(UPLOAD_KEY, state.words);
+    }
+    if (action === "loadWordBank") {
+      const bank = (state.wordBanks || []).find((item) => item.id === payload.bankId);
+      if (bank && Array.isArray(bank.words) && bank.words.length) {
+        state.words = structuredClone(bank.words);
+        state.activeWordId = state.words[0].id;
+        state.activeDay = state.words[0].day || 1;
+        state.batchName = bank.name;
+        state.batchDate = bank.date;
+        state.newWordIds = state.words.map((word) => word.id);
+        state.activeBankId = bank.id;
+        state.spellTask = null;
+        state.showSpellAnswers = false;
+      }
+    }
+    if (action === "publishSpellTask") {
+      state.spellTask = payload.task;
+      state.showSpellAnswers = false;
+      Object.values(state.students || {}).forEach((student) => {
+        student.answer = "";
+        student.answers = [];
+        student.submittedAt = null;
+        student.status = "idle";
+        student.correct = null;
+        student.feedback = "";
+      });
+    }
+    if (action === "gradeItem") {
+      const student = state.students[payload.studentId];
+      if (student) {
+        student.itemResults = student.itemResults || {};
+        student.itemResults[payload.itemId] = Boolean(payload.correct);
+        student.status = "reviewing";
+      }
+    }
+    if (action === "publishGrades") {
+      const student = state.students[payload.studentId];
+      const task = state.spellTask;
+      if (student && task) {
+        const checked = task.items.filter((item) => item.id in (student.itemResults || {})).map((item) => Boolean(student.itemResults[item.id]));
+        student.correct = checked.length > 0 && checked.every(Boolean);
+        student.status = "checked";
+        student.feedback = payload.feedback || "";
+      }
+    }
+    if (action === "setSpellAnswerVisibility") state.showSpellAnswers = Boolean(payload.visible);
+    if (action === "submitAnswer") {
+      state.students[session.clientId] = {
+        ...(state.students[session.clientId] || { clientId: session.clientId, name: session.name }),
+        answer: payload.answer || "",
+        answers: Array.isArray(payload.answers) ? payload.answers : [],
+        submittedAt: new Date().toISOString(),
+        status: "pending",
+        correct: null,
+        feedback: ""
+      };
+    }
+    if (action === "teacherFeedback") {
+      const student = state.students[payload.studentId];
+      if (student) {
+        student.correct = Boolean(payload.correct);
+        student.status = "checked";
+        student.feedback = payload.feedback || "";
+        session.progress[state.activeWordId] = student.correct;
+        writeJson(PROGRESS_KEY, session.progress);
+      }
+    }
+    state.version = Number(state.version || 0) + 1;
+    writeJson(OFFLINE_KEY, state);
+  }
+
+  async function performAction(action, payload) {
+    try {
+      await sendAction(action, payload, true);
+      setConnectionStatus(session.offline ? "单机模式" : "在线同步", !session.offline);
+    } catch (error) {
+      console.error(error);
+      setConnectionStatus("操作失败", false);
+    }
+  }
+
+  function setConnectionStatus(text, online) {
+    dom.connectionStatus.textContent = text;
+    dom.connectionStatus.classList.toggle("online", Boolean(online));
+    dom.connectionStatus.classList.toggle("offline", !online);
+  }
+
+  function leaveClassroom() {
+    stopReadQueue();
+    if (session.pollingTimer) clearInterval(session.pollingTimer);
+    session.pollingTimer = null;
+    session.state = null;
+    session.joined = false;
+    session.connected = false;
+    session.offline = false;
+    showHome();
+  }
+
+  function renderAll() {
+    if (!session.state || !session.joined || session.view === "home") return;
+    renderDayNav();
+    renderWordList();
+    renderReadGrid();
+    renderUnderstandingList();
+    renderSpellView();
+    renderSubmissions();
+    updateHeaderStats();
+    updateCanvasMode();
+  }
+
+  function visibleWords() {
+    const words = session.state.words || [];
+    const day = Number(session.state.activeDay || words[0]?.day || 1);
+    const filtered = words.filter((word) => Number(word.day || 1) === day);
+    return filtered.length ? filtered : words;
+  }
+
+  function currentWord() {
+    const words = session.state?.words || [];
+    return words.find((word) => word.id === session.state.activeWordId) || words[0] || null;
+  }
+
+  function renderDayNav() {
+    const words = session.state.words || [];
+    const days = [...new Set(words.map((word) => Number(word.day || 1)))].sort((a,b) => a-b);
+    dom.dayNav.innerHTML = days.map((day) => {
+      const dayWords = words.filter((word) => Number(word.day || 1) === day);
+      const done = dayWords.filter((word) => session.progress[word.id]).length;
+      const active = Number(session.state.activeDay) === day;
+      return `<button class="day-button${active ? " is-active" : ""}" data-day="${day}" type="button" ${session.role === "student" ? "disabled" : ""}>
+        <strong>DAY ${day}</strong><span>${done} / ${dayWords.length} 已收获</span>
+      </button>`;
+    }).join("");
+    const total = words.length;
+    const done = words.filter((word) => session.progress[word.id]).length;
+    dom.weekProgressText.textContent = `${done} / ${total}`;
+    dom.wordListCount.textContent = `${total} 个`;
+    dom.wordBankLabel.textContent = session.state.batchName || (session.offline ? "本地词库" : "房间词库");
+    dom.activeDayLabel.textContent = session.state.activeDay || 1;
+    renderWordBanks();
+  }
+
+  function renderWordBanks() {
+    const banks = Array.isArray(session.state.wordBanks) ? session.state.wordBanks : [];
+    const activeId = session.state.activeBankId || (banks.length ? banks[banks.length - 1].id : "");
+    dom.wordBankSelect.innerHTML = banks.slice().reverse().map((bank) => {
+      const label = `${bank.date || "日期未知"} · ${bank.name || "词库"} · ${bank.words?.length || 0} 词`;
+      return `<option value="${escapeHtml(bank.id)}" ${bank.id === activeId ? "selected" : ""}>${escapeHtml(label)}</option>`;
+    }).join("");
+    dom.wordBankSelect.disabled = session.role !== "teacher" || !banks.length;
+    dom.loadWordBankButton.disabled = session.role !== "teacher" || !banks.length;
+  }
+
+  async function loadSelectedWordBank() {
+    if (session.role !== "teacher") return;
+    const bankId = dom.wordBankSelect.value;
+    if (!bankId || bankId === session.state.activeBankId) return;
+    await performAction("loadWordBank", { bankId });
+  }
+
+  function masked(value) {
+    return String(value || "").replace(/[A-Za-z]/g, "•");
+  }
+
+  function renderWordList() {
+    const words = visibleWords();
+    const pending = words.filter((word) => !session.progress[word.id]).length;
+    dom.dailyPendingCount.textContent = `${pending} 个`;
+    dom.dayWordList.innerHTML = words.map((word, index) => {
+      const active = word.id === session.state.activeWordId;
+      const done = Boolean(session.progress[word.id]);
+      const text = session.role === "student" && session.view === "spell" ? masked(word.word) : word.word;
+      return `<button class="word-list-button${active ? " is-active" : ""}" data-word-id="${escapeHtml(word.id)}" type="button" ${session.role === "student" ? "disabled" : ""}>
+        <span class="word-index">${String(index+1).padStart(2,"0")}</span><b>${escapeHtml(text)}</b><span>${done ? "🌾" : "🌱"}</span>
+      </button>`;
+    }).join("");
+  }
+
+  function renderReadGrid() {
+    dom.readWordGrid.innerHTML = visibleWords().map((word) => {
+      const active = word.id === session.state.activeWordId;
+      return `<article class="read-word-tile${active ? " is-active" : ""}" data-word-id="${escapeHtml(word.id)}">
+        <strong>${escapeHtml(word.word)}</strong>
+        <small>${escapeHtml(word.phonetic || "点击喇叭听发音")}</small>
+        <button class="mini-speaker" data-speak-id="${escapeHtml(word.id)}" type="button" aria-label="播放 ${escapeHtml(word.word)} 的发音">🔊</button>
+      </article>`;
+    }).join("");
+    bindReadSpeakers();
+  }
+
+  function bindReadSpeakers() {
+    dom.readWordGrid.querySelectorAll("[data-speak-id]").forEach((button) => {
+      button.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const word = (session.state.words || []).find((item) => item.id === button.dataset.speakId);
+        if (!word) return;
+        button.classList.add("is-loading");
+        button.disabled = true;
+        button.textContent = "…";
+        try {
+          const started = await speakWord(word, { waitForEnd: false });
+          button.dataset.lastResult = started ? "playing" : "failed";
+        } catch (error) {
+          button.dataset.lastResult = "failed";
+        } finally {
+          button.classList.remove("is-loading");
+          button.disabled = false;
+          button.textContent = "🔊";
+        }
+      });
+    });
+  }
+
+  function renderUnderstandingList() {
+    dom.understandingList.innerHTML = visibleWords().map((word) => {
+      const active = word.id === session.state.activeWordId;
+      const derivatives = (word.derivatives || []).map((item) => {
+        const name = Array.isArray(item) ? item[0] : item;
+        const meaning = Array.isArray(item) ? item[1] : "";
+        return `<li><b>${escapeHtml(name)}</b><span>${escapeHtml(meaning || "待教师复核")}</span></li>`;
+      }).join("") || "<li><span>暂无派生词</span></li>";
+      const phraseExamples = Array.isArray(word.phraseExamples) ? word.phraseExamples : [];
+      const phrases = phraseExamples.length
+        ? phraseExamples.map((item) => `<li class="phrase-example-item">
+            <div><b>${escapeHtml(item.phrase)}</b><span>${escapeHtml(item.meaning || "")}</span></div>
+            <p>${escapeHtml(item.example || "待补充例句")}</p>
+            ${item.translation ? `<small>${escapeHtml(item.translation)}</small>` : ""}
+            ${item.source ? `<em>${escapeHtml(item.source)}</em>` : ""}
+          </li>`).join("")
+        : (word.phrases || []).map((item) => `<li><span>${escapeHtml(item)}</span></li>`).join("") || "<li><span>暂无短语</span></li>";
+      const segments = (word.segments || []).map((item) => `<span class="segment-chip">${escapeHtml(item)}</span>`).join("");
+      const enrichment = word.enrichment || {};
+      const reviewClass = enrichment.needsReview ? "needs-review" : "verified";
+      const reviewText = enrichment.needsReview ? "待教师复核" : (enrichment.providers?.length ? "已在线核验" : "");
+      return `<article class="understand-card${active ? " is-active" : ""}" data-word-id="${escapeHtml(word.id)}">
+        <header class="understand-head">
+          <h2 lang="en">${escapeHtml(word.word)}</h2>
+          <div class="word-head-meta">
+            <span>${escapeHtml(word.phonetic || "音标待补充")}</span>
+            ${reviewText ? `<em class="enrichment-badge ${reviewClass}">${escapeHtml(reviewText)}</em>` : ""}
+          </div>
+        </header>
+        <div class="meaning-line">${escapeHtml(word.part || "")} ${escapeHtml(word.meaning || "暂无释义")}</div>
+        <div class="segment-strip">${segments}</div>
+        <div class="understand-grid">
+          <section><h3>谐音 / 画面记忆</h3><p>${escapeHtml(word.mnemonic || word.hook || "暂无助记")}</p></section>
+          <section><h3>派生词</h3><ul class="pixel-list">${derivatives}</ul></section>
+          <section class="phrase-section"><h3>延伸短语与对应例句</h3><ul class="phrase-example-list">${phrases}</ul></section>
+          <section><h3>单词例句</h3><p>${escapeHtml(word.example || "暂无例句")}</p>${word.exampleTranslation ? `<small>${escapeHtml(word.exampleTranslation)}</small>` : ""}</section>
+        </div>
+      </article>`;
+    }).join("");
+  }
+
+  function todayWords() {
+    const all = session.state.words || [];
+    const ids = new Set(session.state.newWordIds || []);
+    const today = new Date().toISOString().slice(0, 10);
+    const isToday = session.state.batchDate === today;
+    return isToday && ids.size ? all.filter((word) => ids.has(word.id)) : visibleWords();
+  }
+
+  function taskTypeLabel(type) {
+    return {
+      "meaning-to-word": "看汉写英",
+      "word-to-meaning": "看英写汉",
+      "listen-to-word": "听音写词",
+      "matching": "单词-汉译连线",
+      "completion": "拼写补全",
+      "cloze": "选词填空",
+      "retry": "错词重测"
+    }[type] || "默写任务";
+  }
+
+  function shuffle(items) {
+    const copy = [...items];
+    for (let index = copy.length - 1; index > 0; index -= 1) {
+      const randomIndex = Math.floor(Math.random() * (index + 1));
+      [copy[index], copy[randomIndex]] = [copy[randomIndex], copy[index]];
+    }
+    return copy;
+  }
+
+  function ensureSpellSelection() {
+    const words = todayWords();
+    const valid = new Set(words.map((word) => word.id));
+    session.selectedSpellIds = new Set([...session.selectedSpellIds].filter((id) => valid.has(id)));
+    if (!session.selectedSpellIds.size && words.length) {
+      words.forEach((word) => session.selectedSpellIds.add(word.id));
+    }
+  }
+
+  function renderSpellBuilder() {
+    const words = todayWords();
+    ensureSpellSelection();
+    dom.spellSelectedCount.textContent = `已选 ${session.selectedSpellIds.size} 个`;
+    dom.spellWordChecklist.innerHTML = words.map((word) => `
+      <label class="spell-check-row">
+        <input type="checkbox" data-spell-word="${escapeHtml(word.id)}" ${session.selectedSpellIds.has(word.id) ? "checked" : ""}>
+        <strong lang="en">${escapeHtml(word.word)}</strong>
+        <small>${escapeHtml(word.meaning || "")}</small>
+      </label>
+    `).join("") || `<div class="empty-basket">当前没有可布置的单词。教师可以点击右上角“导入词库”，或在左侧加载历史词库。</div>`;
+  }
+
+  function setAllSpellSelection(checked) {
+    session.selectedSpellIds = checked
+      ? new Set(todayWords().map((word) => word.id))
+      : new Set();
+    renderSpellBuilder();
+  }
+
+  function invertSpellSelection() {
+    const next = new Set();
+    todayWords().forEach((word) => {
+      if (!session.selectedSpellIds.has(word.id)) next.add(word.id);
+    });
+    session.selectedSpellIds = next;
+    renderSpellBuilder();
+  }
+
+  function handleSpellCheckChange(event) {
+    const checkbox = event.target.closest("[data-spell-word]");
+    if (!checkbox) return;
+    if (checkbox.checked) session.selectedSpellIds.add(checkbox.dataset.spellWord);
+    else session.selectedSpellIds.delete(checkbox.dataset.spellWord);
+    dom.spellSelectedCount.textContent = `已选 ${session.selectedSpellIds.size} 个`;
+  }
+
+
+  function formatSequenceNumber(number) {
+    return String(Math.max(1, Number(number) || 1));
+  }
+
+  function createMaskedWord(value) {
+    const chars = [...String(value || "")];
+    if (chars.length <= 1) return { masked: "_", missing: chars.join("") };
+    const candidates = [];
+    for (let index = 0; index < chars.length; index += 1) {
+      if (/[A-Za-z]/.test(chars[index])) candidates.push(index);
+    }
+    if (!candidates.length) return { masked: chars.join(""), missing: "" };
+    const interior = candidates.filter((index) => index > 0 && index < chars.length - 1);
+    const available = interior.length ? interior : candidates;
+    const blankCount = Math.min(available.length, chars.length <= 8 ? 1 : chars.length <= 12 ? 2 : 3);
+    const selected = shuffle(available).slice(0, blankCount).sort((a, b) => a - b);
+    const selectedSet = new Set(selected);
+    return {
+      masked: chars.map((char, index) => selectedSet.has(index) ? "_" : char).join(""),
+      missing: selected.map((index) => chars[index]).join("")
+    };
+  }  function buildSpellTaskData(type, words) {
+    const source = type === "retry"
+      ? words.filter((word) => !session.progress[word.id])
+      : words;
+    const usable = source.length ? source : words;
+    let matching = [];
+    let baseItems = [];
+
+    if (type === "matching") {
+      const rightOrder = shuffle(usable);
+      const rightByWordId = new Map(rightOrder.map((word, index) => [word.id, {
+        letter: String.fromCharCode(65 + index),
+        meaning: word.meaning || ""
+      }]));
+      const leftOrder = shuffle(usable);
+      matching = {
+        left: leftOrder.map((word, index) => ({ roman: formatSequenceNumber(index + 1), wordId: word.id, word: word.word })),
+        right: rightOrder.map((word, index) => ({ letter: String.fromCharCode(65 + index), wordId: word.id, meaning: word.meaning || "" }))
+      };
+      baseItems = leftOrder.map((word, index) => {
+        const right = rightByWordId.get(word.id);
+        return {
+          id: `task-${index}-${word.id}`,
+          wordId: word.id,
+          type,
+          prompt: word.word,
+          subPrompt: "",
+          answer: right?.letter || "",
+          audioText: "",
+          hint: "",
+          roman: formatSequenceNumber(index + 1),
+          leftWord: word.word,
+          rightLetter: right?.letter || "",
+          rightMeaning: right?.meaning || ""
+        };
+      });
+      return { items: baseItems, matching };
+    }
+
+    baseItems = shuffle(usable.map((word, index) => {
+      const first = word.word.slice(0, 1);
+      const last = word.word.slice(-1);
+      if (type === "word-to-meaning") {
+        return { id: `task-${index}-${word.id}`, wordId: word.id, type, prompt: word.word, subPrompt: word.phonetic || "", answer: word.meaning || "", audioText: word.word, hint: "" };
+      }
+      if (type === "listen-to-word") {
+        return { id: `task-${index}-${word.id}`, wordId: word.id, type, prompt: "听音写词", subPrompt: "点击喇叭播放发音，再填写英文单词。", answer: word.word, audioText: word.word, hint: "" };
+      }
+      if (type === "completion") {
+        const maskedWord = createMaskedWord(word.word);
+        return {
+          id: `task-${index}-${word.id}`,
+          wordId: word.id,
+          type,
+          prompt: maskedWord.masked,
+          subPrompt: `${word.part ? `${word.part} ` : ""}${word.meaning || ""}`,
+          answer: word.word,
+          audioText: "",
+          hint: "补全缺失字母后提交完整单词",
+          maskedWord: maskedWord.masked,
+          missingLetters: maskedWord.missing
+        };
+      }
+      if (type === "cloze") {
+        const phraseExample = (word.phraseExamples || []).find((item) => item.example);
+        const example = (phraseExample && phraseExample.example) || word.example || word.meaning || "";
+        const escaped = word.word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const prompt = example ? example.replace(new RegExp(escaped, "i"), "_____") : word.meaning;
+        return { id: `task-${index}-${word.id}`, wordId: word.id, type, prompt, subPrompt: "根据语境填写英文单词。", answer: word.word, audioText: "", hint: "" };
+      }
+      return { id: `task-${index}-${word.id}`, wordId: word.id, type: "meaning-to-word", prompt: word.meaning || "", subPrompt: "请写出对应的英文单词。", answer: word.word, audioText: "", hint: "" };
+    }));
+    return { items: baseItems, matching: [] };
+  }
+
+  async function generateSpellTask(publish) {
+    ensureSpellSelection();
+    const selected = todayWords().filter((word) => session.selectedSpellIds.has(word.id));
+    if (!selected.length) {
+      alert("请至少勾选一个今日单词。");
+      return;
+    }
+    const type = dom.spellTaskType.value;
+    let taskWords = selected;
+    if (type === "matching" && selected.length > 26) {
+      alert("单词-汉译连线一次最多支持 26 个单词，本次先使用前 26 个。");
+      taskWords = selected.slice(0, 26);
+    }
+    const built = buildSpellTaskData(type, taskWords);
+    const task = {
+      id: `task-${Date.now()}`,
+      type,
+      title: `${taskTypeLabel(type)} · 乱序任务`,
+      wordIds: taskWords.map((word) => word.id),
+      items: built.items,
+      matching: built.matching
+    };
+    if (!publish) {
+      session.previewTask = task;
+      renderSpellView();
+      return;
+    }
+    session.previewTask = null;
+    await performAction("publishSpellTask", { task });
+  }
+
+  function renderSpellView() {
+    if (session.role === "teacher") renderSpellBuilder();
+    const task = session.previewTask || session.state.spellTask;
+    if (!task) {
+      dom.spellTaskTitle.textContent = "等待教师发布";
+      dom.spellTaskCount.textContent = "0 题";
+      const emptyMessage = session.role === "teacher"
+        ? "词库已经准备好。请先在上方勾选单词，点击“生成乱序任务”，确认顺序后点击“发布给学生”。"
+        : "老师暂时还没有发布默写任务，你可以先进入读音浇灌或理解施肥继续学习。";
+      dom.spellTaskList.innerHTML = `<div class="empty-basket actionable-empty">${emptyMessage}</div>`;
+      dom.submitSpellTask.classList.toggle("is-hidden", session.role !== "student");
+      dom.toggleTeacherAnswer.classList.add("is-hidden");
+      dom.toggleStudentAnswer.classList.add("is-hidden");
+      dom.answerKeyPanel.classList.add("is-hidden");
+      dom.studentTaskResult.textContent = "等待教师发布任务";
+      return;
+    }
+    dom.spellTaskTitle.textContent = task.title || taskTypeLabel(task.type);
+    dom.spellTaskCount.textContent = `${task.items.length} 题`;
+    dom.toggleTeacherAnswer.classList.remove("is-hidden");
+    dom.toggleStudentAnswer.classList.remove("is-hidden");
+    dom.toggleTeacherAnswer.textContent = session.teacherShowAnswer ? "隐藏标准答案" : "查看标准答案";
+    dom.toggleStudentAnswer.textContent = session.state.showSpellAnswers ? "停止向学生展示答案" : "向学生展示答案";
+    dom.submitSpellTask.classList.toggle("is-hidden", session.role !== "student");
+    if (task.type === "matching" && task.matching) {
+      renderMatchingTask(task);
+    } else {
+      renderStandardTask(task);
+    }
+    renderAnswerKeyPanel(task);
+    renderStudentTaskResult();
+  }
+
+  function renderStandardTask(task) {
+    dom.spellTaskList.innerHTML = task.items.map((item, index) => `
+      <article class="spell-task-row${item.type === "completion" ? " completion-task-row" : ""}" data-task-id="${escapeHtml(item.id)}">
+        <span class="task-number">${String(index + 1).padStart(2, "0")}</span>
+        <div class="task-prompt">
+          <strong class="${item.type === "completion" ? "masked-word" : ""}">${escapeHtml(item.prompt)}</strong>
+          <small>${escapeHtml(item.subPrompt || "")} ${item.hint ? `· ${escapeHtml(item.hint)}` : ""}</small>
+          ${item.audioText ? `<button class="pixel-button task-listening" data-task-audio="${escapeHtml(item.audioText)}" type="button">🔊 播放发音</button>` : ""}
+        </div>
+        <div class="task-answer">
+          ${session.role === "student"
+            ? `<input data-task-index="${index}" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="${item.type === "completion" ? "填写完整单词" : "填写答案"}">`
+            : `<span class="task-answer-key">${session.teacherShowAnswer ? escapeHtml(item.answer) : "答案已隐藏"}</span>`}
+        </div>
+      </article>
+    `).join("");
+  }
+
+  function renderMatchingTask(task) {
+    const left = Array.isArray(task.matching.left) ? task.matching.left : [];
+    const right = Array.isArray(task.matching.right) ? task.matching.right : [];
+    const answerRows = task.items.map((item, index) => {
+      const value = session.role === "teacher" && session.teacherShowAnswer ? item.answer : "";
+      return `<label class="matching-answer-row">
+        <b>${escapeHtml(item.roman || formatSequenceNumber(index + 1))}.</b>
+        <input data-task-index="${index}" type="text" maxlength="2" value="${escapeHtml(value)}" placeholder="_" ${session.role === "teacher" ? "disabled" : ""} autocomplete="off">
+      </label>`;
+    }).join("");
+    dom.spellTaskList.innerHTML = `
+      <div class="matching-board">
+        <section class="matching-column matching-left">
+          <h3>英文单词</h3>
+          ${left.map((item) => `<div class="matching-item"><b>${escapeHtml(item.roman)}</b><strong>${escapeHtml(item.word)}</strong></div>`).join("")}
+        </section>
+        <section class="matching-column matching-right">
+          <h3>中文释义（已打乱）</h3>
+          ${right.map((item) => `<div class="matching-item"><b>${escapeHtml(item.letter)}</b><span>${escapeHtml(item.meaning)}</span></div>`).join("")}
+        </section>
+      </div>
+      <div class="matching-answer-sheet">
+        <h3>答题卡</h3>
+        <div class="matching-answer-grid">${answerRows}</div>
+      </div>
+    `;
+  }
+
+  function renderAnswerKeyPanel(task) {
+    const visible = session.teacherShowAnswer && session.role === "teacher";
+    dom.answerKeyPanel.classList.toggle("is-hidden", !visible);
+    if (!visible) return;
+    if (task.type === "matching" && task.matching) {
+      dom.answerKeyPanel.innerHTML = `<h3>连线标准答案</h3><ul class="answer-key-list">${task.items.map((item) => `<li><b>${escapeHtml(item.roman)} — ${escapeHtml(item.answer)}</b> ${escapeHtml(item.leftWord)} — ${escapeHtml(item.rightMeaning)}</li>`).join("")}</ul>`;
+      return;
+    }
+    dom.answerKeyPanel.innerHTML = `<h3>标准答案</h3><ul class="answer-key-list">${task.items.map((item, index) => `<li><b>${index + 1}. ${escapeHtml(item.answer)}</b></li>`).join("")}</ul>`;
+  }
+  function updateHeaderStats() {
+    const words = visibleWords();
+    const index = Math.max(0, words.findIndex((word) => word.id === session.state.activeWordId));
+    dom.wordPosition.textContent = `${words.length ? index + 1 : 0} / ${words.length}`;
+    dom.studentCount.textContent = `${Object.keys(session.state.students || {}).length} 位学生在线`;
+    dom.submissionCounter.textContent = `${Object.keys(session.state.students || {}).length} 份`;
+  }
+
+  async function selectDay(day) {
+    if (session.role !== "teacher") return;
+    const first = (session.state.words || []).find((word) => Number(word.day || 1) === day);
+    if (!first) return;
+    session.state.activeDay = day;
+    session.state.activeWordId = first.id;
+    await performAction("setDay", { day });
+  }
+
+  async function selectWord(wordId) {
+    if (session.role !== "teacher") return;
+    await performAction("setWord", { wordId });
+  }
+
+  async function moveWord(delta) {
+    const words = visibleWords();
+    if (!words.length || session.role !== "teacher") return null;
+    const index = words.findIndex((word) => word.id === session.state.activeWordId);
+    const next = words[(index + delta + words.length) % words.length];
+    if (!next) return null;
+    session.state.activeWordId = next.id;
+    renderAll();
+    try {
+      await sendAction("setWord", { wordId: next.id }, false);
+    } catch (error) {
+      console.warn("单词切换同步失败", error);
+    }
+    return next;
+  }
+
+  function handleReadGridClick(event) {
+    const speaker = event.target.closest("[data-speak-id]");
+    if (speaker) {
+      const word = (session.state.words || []).find((item) => item.id === speaker.dataset.speakId);
+      speakWord(word);
+      return;
+    }
+    const tile = event.target.closest("[data-word-id]");
+    if (tile && session.role === "teacher") selectWord(tile.dataset.wordId);
+  }
+
+  function playRemoteAudio(text, { waitForEnd = true, onStart } = {}) {
+    return new Promise((resolve, reject) => {
+      const source = location.protocol === "file:"
+        ? `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(text)}&type=2`
+        : `/api/audio?word=${encodeURIComponent(text)}`;
+      const audio = new Audio(source);
+      audio.preload = "auto";
+      audio.volume = 1;
+      audio.muted = false;
+      audio.playsInline = true;
+      session.activeAudio = audio;
+      let started = false;
+      let settled = false;
+      let startTimer = null;
+      const clearStartTimer = () => { if (startTimer) clearTimeout(startTimer); startTimer = null; };
+      const fail = (error) => {
+        if (settled) return;
+        settled = true;
+        clearStartTimer();
+        if (session.activeAudio === audio) session.activeAudio = null;
+        reject(error);
+      };
+      const start = () => {
+        if (started) return;
+        started = true;
+        clearStartTimer();
+        if (typeof onStart === "function") onStart();
+        if (!waitForEnd) {
+          settled = true;
+          resolve(true);
+        }
+      };
+      audio.onplaying = start;
+      audio.onended = () => {
+        start();
+        if (settled) return;
+        settled = true;
+        clearStartTimer();
+        if (session.activeAudio === audio) session.activeAudio = null;
+        resolve(true);
+      };
+      audio.onerror = () => fail(new Error("音频播放失败"));
+      startTimer = setTimeout(() => fail(new Error("音频加载超时")), 2500);
+      audio.play().catch(fail);
+    });
+  }
+
+  function speechVoices() {
+    if (!("speechSynthesis" in window)) return [];
+    return window.speechSynthesis.getVoices().filter((voice) => /^en(-|_|$)/i.test(voice.lang));
+  }
+
+  function playBrowserSpeech(text, { waitForEnd = true, onStart } = {}) {
+    return new Promise((resolve) => {
+      if (!("speechSynthesis" in window)) {
+        resolve(false);
+        return;
+      }
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = "en-US";
+      utterance.rate = 0.8;
+      const voices = speechVoices();
+      if (voices.length) utterance.voice = voices.find((voice) => /US|United States/i.test(voice.name)) || voices[0];
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve(true);
+      };
+      utterance.onstart = () => {
+        if (typeof onStart === "function") onStart();
+        if (!waitForEnd) finish();
+      };
+      utterance.onend = finish;
+      utterance.onerror = finish;
+      window.speechSynthesis.resume();
+      window.speechSynthesis.speak(utterance);
+      setTimeout(finish, waitForEnd ? 4500 : 1400);
+    });
+  }
+
+  async function speakWord(word, options = {}) {
+    const text = String(word?.word || "").trim();
+    if (!text) return false;
+    if (session.activeAudio) {
+      session.activeAudio.pause();
+      session.activeAudio = null;
+    }
+    try {
+      return await playRemoteAudio(text, options);
+    } catch (error) {
+      console.warn("在线发音不可用，改用浏览器语音", error);
+      return playBrowserSpeech(text, options);
+    }
+  }
+
+  async function runReadQueue() {
+    while (session.readQueueRunning) {
+      const word = currentWord();
+      if (!word) break;
+      await speakWord(word);
+      if (!session.readQueueRunning) break;
+      await delay(650);
+      await moveWord(1);
+      await delay(300);
+    }
+    if (session.readQueueRunning) stopReadQueue();
+  }
+
+  async function toggleReadQueue() {
+    if (session.role !== "teacher") return;
+    if (session.readQueueRunning) {
+      stopReadQueue();
+      return;
+    }
+    if (session.view !== "read") await requestModule("read");
+    session.readQueueRunning = true;
+    dom.readQueueButton.textContent = "■ 停止连续跟读";
+    dom.readQueueButton.classList.remove("success");
+    dom.readQueueButton.classList.add("danger");
+    runReadQueue();
+  }
+
+  function stopReadQueue() {
+    session.readQueueRunning = false;
+    if (session.activeAudio) {
+      session.activeAudio.pause();
+      session.activeAudio = null;
+    }
+    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+    if (dom.readQueueButton) {
+      dom.readQueueButton.textContent = "▶ 开始连续跟读";
+      dom.readQueueButton.classList.add("success");
+      dom.readQueueButton.classList.remove("danger");
+    }
+  }
+
+  function delay(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+  function handleSpellTaskListClick(event) {
+    const button = event.target.closest("[data-task-audio]");
+    if (!button) return;
+    speakWord({ word: button.dataset.taskAudio || "" });
+  }
+
+  async function submitSpellTask() {
+    if (session.role !== "student") return;
+    const task = session.state.spellTask;
+    if (!task) return;
+    const answers = [...dom.spellTaskList.querySelectorAll("[data-task-index]")]
+      .sort((a, b) => Number(a.dataset.taskIndex) - Number(b.dataset.taskIndex))
+      .map((input) => input.value.trim());
+    if (!answers.some(Boolean)) {
+      alert("请至少填写一个答案。");
+      return;
+    }
+    dom.submitSpellTask.disabled = true;
+    try {
+      await sendAction("submitAnswer", { answers, answer: answers.join(" | ") }, false);
+      dom.studentTaskResult.textContent = "已提交，等待老师验收……";
+      dom.studentTaskResult.className = "student-result";
+    } catch (error) {
+      dom.studentTaskResult.textContent = "提交失败，请检查连接";
+      dom.studentTaskResult.className = "student-result wrong";
+    } finally {
+      dom.submitSpellTask.disabled = false;
+    }
+  }
+
+  function renderStudentTaskResult() {
+    const student = (session.state.students || {})[session.clientId];
+    if (session.role === "teacher") {
+      dom.studentTaskResult.textContent = "学生提交后，整份答卷会进入右侧“收获框”。";
+      dom.studentTaskResult.className = "student-result";
+      return;
+    }
+    if (!student || !student.submittedAt) {
+      dom.studentTaskResult.textContent = "尚未提交";
+      dom.studentTaskResult.className = "student-result";
+      return;
+    }
+    if (student.status === "pending" || student.status === "reviewing") {
+      dom.studentTaskResult.textContent = "已提交，等待老师逐题验收……";
+      dom.studentTaskResult.className = "student-result";
+      return;
+    }
+    const task = session.state.spellTask;
+    const results = student.itemResults || {};
+    const details = task?.items?.map((item, index) => {
+      const result = results[item.id];
+      const mark = result === true ? "✓" : result === false ? "✕" : "…";
+      const answer = session.state.showSpellAnswers ? ` · ${escapeHtml(item.answer)}` : "";
+      return `<li class="${result === true ? "correct" : result === false ? "wrong" : ""}"><b>${index + 1}.</b> ${mark}${answer}</li>`;
+    }).join("") || "";
+    dom.studentTaskResult.innerHTML = `
+      <strong>${student.correct ? "批改完成：整卷通过" : "批改完成：请订正错题"}</strong>
+      ${student.feedback ? `<p>老师：${escapeHtml(student.feedback)}</p>` : ""}
+      <ul class="student-grade-list">${details}</ul>
+    `;
+    dom.studentTaskResult.className = `student-result ${student.correct ? "correct" : "wrong"}`;
+  }
+
+  function renderSubmissions() {
+    const students = Object.values(session.state.students || {});
+    const visible = session.role === "teacher" ? students : students.filter((student) => student.clientId === session.clientId);
+    if (!visible.length) {
+      dom.studentSubmissions.innerHTML = `<div class="empty-basket">学生加入并提交后，答卷会出现在这里。</div>`;
+      return;
+    }
+    const task = session.state.spellTask;
+    dom.studentSubmissions.innerHTML = visible.map((student) => {
+      const submitted = Boolean(student.submittedAt);
+      const results = student.itemResults || {};
+      const statusClass = student.status === "checked" ? (student.correct ? "status-correct" : "status-wrong") : "status-pending";
+      const statusText = !submitted ? "未提交" : student.status === "checked" ? (student.correct ? "整卷正确" : "需要重写") : "待逐题验收";
+      const items = task?.items || [];
+      const rows = items.map((item, index) => {
+        const value = student.answers?.[index] || "—";
+        const result = results[item.id];
+        return `<li class="grading-row">
+          <span class="grading-number">${index + 1}</span>
+          <b>${escapeHtml(value)}</b>
+          ${session.role === "teacher" && submitted ? `<span class="grading-actions">
+            <button class="${result === true ? "is-active" : ""}" type="button" data-grade-item="${escapeHtml(item.id)}" data-grade-student="${escapeHtml(student.clientId)}" data-grade-correct="true">✓</button>
+            <button class="${result === false ? "is-active wrong" : ""}" type="button" data-grade-item="${escapeHtml(item.id)}" data-grade-student="${escapeHtml(student.clientId)}" data-grade-correct="false">✕</button>
+          </span>` : `<span class="grading-mark ${result === true ? "correct" : result === false ? "wrong" : ""}">${result === true ? "✓" : result === false ? "✕" : "…"}</span>`}
+        </li>`;
+      }).join("");
+      return `<article class="submission-card" data-student-id="${escapeHtml(student.clientId)}">
+        <header><span>${escapeHtml(student.name || "学生")}</span><small class="${statusClass}">${statusText}</small></header>
+        <ul class="submission-answer-list grading-list">${rows || `<li>${escapeHtml(student.answer || "—")}</li>`}</ul>
+        ${session.role === "teacher" && submitted ? `<div class="feedback-actions">
+          <button class="pixel-button success" type="button" data-publish-grades="${escapeHtml(student.clientId)}">发布批改结果</button>
+        </div>` : ""}
+      </article>`;
+    }).join("");
+  }
+
+  async function handleFeedbackClick(event) {
+    if (session.role !== "teacher") return;
+    const gradeButton = event.target.closest("[data-grade-item]");
+    if (gradeButton) {
+      await sendAction("gradeItem", {
+        studentId: gradeButton.dataset.gradeStudent,
+        itemId: gradeButton.dataset.gradeItem,
+        correct: gradeButton.dataset.gradeCorrect === "true"
+      }, false);
+      renderSubmissions();
+      return;
+    }
+    const publishButton = event.target.closest("[data-publish-grades]");
+    if (!publishButton) return;
+    const feedback = window.prompt("可选反馈（留空即可）", "") || "";
+    await sendAction("publishGrades", { studentId: publishButton.dataset.publishGrades, feedback }, false);
+    renderSubmissions();
+    renderStudentTaskResult();
+  }
+
+  async function copyInvite() {
+    if (location.protocol === "file:") {
+      alert("请先运行 server.py，再复制学生链接。");
+      return;
+    }
+    const invite = `${location.origin}/#auto=1&role=student&room=${encodeURIComponent(session.room)}&name=学生&module=spell`;
+    try {
+      await navigator.clipboard.writeText(invite);
+      dom.copyInviteButton.textContent = "已复制";
+      setTimeout(() => { dom.copyInviteButton.textContent = "复制学生链接"; }, 1500);
+    } catch (error) {
+      window.prompt("请复制学生链接", invite);
+    }
+  }
+
+  async function loadWordFile(event) {
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+    const buffer = await file.arrayBuffer();
+    let text = new TextDecoder("utf-8", { fatal: false }).decode(buffer);
+    if (text.includes("\uFFFD") || /[\u0080-\u00FF]{2,}/.test(text)) {
+      try {
+        const fallback = new TextDecoder("gb18030", { fatal: false }).decode(buffer);
+        if (!fallback.includes("\uFFFD")) text = fallback;
+      } catch (error) {
+        console.warn("GB18030 解码不可用", error);
+      }
+    }
+    dom.uploadText.value = text.replace(/^\uFEFF/, "");
+    updateUploadPreview();
+  }
+
+  function updateUploadPreview() {
+    try {
+      const words = parseVocabularyText(dom.uploadText.value);
+      dom.uploadPreview.textContent = words.length ? `已解析 ${words.length} 个单词` : "尚未解析";
+    } catch (error) {
+      dom.uploadPreview.textContent = `解析失败：${error.message}`;
+    }
+  }
+
+  function splitList(value) {
+    return String(value || "").split(/[;；]/).map((item) => item.trim()).filter(Boolean);
+  }
+
+  function parsePairs(value) {
+    return splitList(value).map((item) => {
+      const parts = item.split(/[=＝:：]/);
+      return [parts[0].trim(), parts.slice(1).join(":").trim()];
+    }).filter((item) => item[0]);
+  }
+
+  function cleanImportLine(value) {
+    return String(value || "")
+      .replace(/^\uFEFF/, "")
+      .replace(/^[\s\uF0B7\u2022•·※\-–—]+/, "")
+      .trim();
+  }
+
+  function parsePlainWordLine(line, day) {
+    let cleaned = cleanImportLine(line);
+    if (!cleaned || /^DAY\s*\d+/i.test(cleaned)) return null;
+    cleaned = cleaned.replace(/^\d+\s*[.、):：\-]\s*/, "");
+    const wordMatch = cleaned.match(/^([A-Za-z][A-Za-z'’\-]*)/);
+    if (!wordMatch) return null;
+    const word = wordMatch[1];
+    let rest = cleaned.slice(wordMatch[0].length).trim();
+    let phonetic = "";
+    const phoneticMatch = rest.match(/^\/([^/]+)\/\s*/);
+    if (phoneticMatch) {
+      phonetic = `/${phoneticMatch[1]}/`;
+      rest = rest.slice(phoneticMatch[0].length).trim();
+    }
+    let part = "";
+    const posPattern = /^(?:\(|\（)?((?:n|v|adj|adv|prep|conj|pron|num|art|modal|interj)\.(?:\s*&\s*(?:n|v|adj|adv|prep|conj|pron|num|art|modal|interj)\.)?)(?:\)|\）)?\s*/i;
+    const posMatch = rest.match(posPattern);
+    if (posMatch) {
+      part = posMatch[1].replace(/\s+/g, " ");
+      rest = rest.slice(posMatch[0].length).trim();
+    }
+    return {
+      day, word, phonetic, part,
+      meaning: rest.replace(/^[-–—:：|]+\s*/, "").trim(),
+      segments: [], mnemonic: "", derivatives: [], phrases: [],
+      phraseExamples: [], example: "", exampleTranslation: ""
+    };
+  }
+
+  function parseDerivativeLine(value) {
+    return splitList(value).map((item) => {
+      const text = cleanImportLine(item);
+      const match = text.match(/^([A-Za-z][A-Za-z'’\-]*)\s+(.+)$/);
+      return match ? [match[1].trim(), match[2].trim()] : [text, ""];
+    }).filter((item) => item[0]);
+  }
+
+  function parsePhraseLine(value) {
+    return splitList(value).map((item) => {
+      const text = cleanImportLine(item).replace(/[…]+$/, "").trim();
+      const match = text.match(/^(.+?)([\u4e00-\u9fff].*)$/);
+      return match
+        ? { phrase: match[1].replace(/[…]+$/, "").trim(), meaning: match[2].trim(), example: "", translation: "", source: "教师上传" }
+        : { phrase: text, meaning: "", example: "", translation: "", source: "教师上传" };
+    }).filter((item) => item.phrase);
+  }
+
+  function parseExampleLine(value) {
+    const text = cleanImportLine(value);
+    const match = text.match(/^(.+?)([\u4e00-\u9fff].*)$/);
+    return match
+      ? { example: match[1].trim(), translation: match[2].trim() }
+      : { example: text, translation: "" };
+  }
+
+  function parseVocabularyText(text) {
+    const trimmed = String(text || "").trim();
+    if (!trimmed) return [];
+    if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+      const parsed = JSON.parse(trimmed);
+      return Array.isArray(parsed) ? parsed : [parsed];
+    }
+
+    const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    const words = [];
+    let currentDay = 1;
+    let currentWord = null;
+
+    const commitCurrent = () => {
+      if (!currentWord) return;
+      if (!currentWord.phraseExamples?.length && currentWord.phrases?.length) {
+        currentWord.phraseExamples = currentWord.phrases.map((phrase) => {
+          const exampleRecord = currentWord.example && currentWord.example.toLowerCase().includes(phrase.toLowerCase())
+            ? { example: currentWord.example, translation: currentWord.exampleTranslation || "", source: "教师上传" }
+            : { example: "", translation: "", source: "教师上传" };
+          return {
+            phrase,
+            meaning: "",
+            example: exampleRecord.example,
+            translation: exampleRecord.translation,
+            source: exampleRecord.source
+          };
+        });
+      }
+      words.push(currentWord);
+      currentWord = null;
+    };
+
+    lines.forEach((line) => {
+      const dayMatch = line.match(/^DAY\s*(\d+)/i);
+      if (dayMatch) {
+        commitCurrent();
+        currentDay = Number(dayMatch[1]) || currentDay;
+        return;
+      }
+
+      const cleaned = cleanImportLine(line);
+      const detailMatch = cleaned.match(/^(派生词|短语|例句)\s*[:：]\s*(.+)$/);
+      if (detailMatch && currentWord) {
+        const [, label, value] = detailMatch;
+        if (label === "派生词") currentWord.derivatives = parseDerivativeLine(value);
+        if (label === "短语") {
+          const phraseItems = parsePhraseLine(value);
+          currentWord.phrases = phraseItems.map((item) => item.phrase);
+          currentWord.phraseExamples = phraseItems;
+        }
+        if (label === "例句") {
+          const example = parseExampleLine(value);
+          if (!currentWord.example) currentWord.example = example.example;
+          if (!currentWord.exampleTranslation) currentWord.exampleTranslation = example.translation;
+          (currentWord.phraseExamples || []).forEach((phraseItem, index) => {
+            const exact = phraseItem.phrase && example.example.toLowerCase().includes(phraseItem.phrase.toLowerCase());
+            const approximate = index === 0 && phraseItem.phrase && example.example.toLowerCase().includes(phraseItem.phrase.split(/\s+/)[0].replace(/e$/, "").toLowerCase());
+            if (exact || approximate) {
+              phraseItem.example = example.example;
+              phraseItem.translation = example.translation;
+            }
+          });
+        }
+        return;
+      }
+
+      const parts = cleaned.includes("|")
+        ? cleaned.split("|").map((item) => item.trim())
+        : cleaned.split("\t").map((item) => item.trim());
+      if (parts.length >= 5) {
+        commitCurrent();
+        words.push({
+          day: Number(parts[0]) || currentDay,
+          word: parts[1],
+          phonetic: parts[2] || "",
+          part: parts[3] || "",
+          meaning: parts[4] || "",
+          segments: String(parts[5] || "").split(/[，,\-\s]+/).map((item) => item.trim()).filter(Boolean),
+          mnemonic: parts[6] || "",
+          derivatives: parsePairs(parts[7] || ""),
+          phrases: splitList(parts[8] || ""),
+          phraseExamples: [],
+          example: parts[9] || "",
+          exampleTranslation: ""
+        });
+        return;
+      }
+
+      if (parts.length === 2 && /^[A-Za-z]/.test(parts[0])) {
+        commitCurrent();
+        words.push({
+          day: currentDay,
+          word: parts[0],
+          phonetic: "", part: "", meaning: parts[1],
+          segments: [], mnemonic: "", derivatives: [], phrases: [], phraseExamples: [],
+          example: "", exampleTranslation: ""
+        });
+        return;
+      }
+
+      const parsed = parsePlainWordLine(cleaned, currentDay);
+      if (parsed) {
+        commitCurrent();
+        currentWord = parsed;
+      }
+    });
+
+    commitCurrent();
+    if (!words.length) {
+      throw new Error("未识别到单词，请确保每行至少包含“单词 + 词性/中文释义”");
+    }
+    return words;
+  }
+
+  async function enrichCurrentWordBank() {
+    if (session.role !== "teacher" || !session.state) return;
+    const originalText = dom.enrichCurrentWordsButton.textContent;
+    dom.enrichCurrentWordsButton.disabled = true;
+    dom.enrichCurrentWordsButton.textContent = "智能补全中…";
+    try {
+      const enriched = await enrichVocabulary(session.state.words || [], true);
+      await sendAction("replaceWords", {
+        words: enriched,
+        batchName: session.state.batchName || "智能补全词库"
+      }, false);
+      renderAll();
+      dom.enrichCurrentWordsButton.textContent = "补全完成";
+    } catch (error) {
+      console.error(error);
+      alert(`智能补全失败：${error.message}`);
+      dom.enrichCurrentWordsButton.textContent = "补全失败，请重试";
+    } finally {
+      setTimeout(() => {
+        dom.enrichCurrentWordsButton.disabled = false;
+        dom.enrichCurrentWordsButton.textContent = originalText;
+      }, 1800);
+    }
+  }
+  async function enrichVocabulary(words, force = false) {
+    if (!force && (!dom.autoEnrich || !dom.autoEnrich.checked)) return words;
+    if (location.protocol === "file:") {
+      dom.uploadPreview.textContent = "单机模式跳过联网补全，仍会导入基础词汇。";
+      return words;
+    }
+    const enriched = [];
+    const chunkSize = 6;
+    for (let start = 0; start < words.length; start += chunkSize) {
+      const chunk = words.slice(start, start + chunkSize);
+      const end = Math.min(start + chunk.length, words.length);
+      dom.uploadPreview.textContent = `正在联网补充 ${start + 1}–${end} / ${words.length}……`;
+      const response = await fetch("/api/enrich-batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role: "teacher", clientId: session.clientId, words: chunk })
+      });
+      if (!response.ok) throw new Error(`在线补全请求失败：${response.status}`);
+      const result = await response.json();
+      if (!result.ok || !Array.isArray(result.words)) throw new Error(result.error || "在线补全失败");
+      enriched.push(...result.words);
+    }
+    const reviewCount = enriched.filter((word) => word.enrichment && word.enrichment.needsReview).length;
+    dom.uploadPreview.textContent = `联网补全完成：${enriched.length} 个单词${reviewCount ? `，${reviewCount} 个待教师复核` : "，全部已核验"}`;
+    return enriched;
+  }
+
+  async function confirmUpload() {
+    if (!dom.confirmUpload) return;
+    dom.confirmUpload.disabled = true;
+    try {
+      let words = parseVocabularyText(dom.uploadText.value);
+      if (!words.length) throw new Error("没有可导入的单词");
+      try {
+        words = await enrichVocabulary(words);
+      } catch (error) {
+        console.warn(error);
+        dom.uploadPreview.textContent = "在线补全失败，已保留原始词条，导入后仍可继续学习。";
+      }
+      const batchName = `今日词库 ${new Date().toLocaleDateString("zh-CN")}`;
+      await sendAction("replaceWords", { words, batchName }, false);
+      dom.uploadDialog.close();
+      renderAll();
+    } catch (error) {
+      alert(`导入失败：${error.message}`);
+    } finally {
+      dom.confirmUpload.disabled = false;
+    }
+  }
+
+  function annotationKey() {
+    if (!session.state) return "global";
+    if (session.view === "read") return `read:day:${session.state.activeDay || 1}`;
+    if (session.view === "understand") return `understand:word:${session.state.activeWordId || "none"}`;
+    if (session.view === "spell") return `spell:word:${session.state.activeWordId || "none"}`;
+    return "home";
+  }
+
+  function handleToolClick(event) {
+    const button = event.target.closest("[data-tool]");
+    if (!button) return;
+    session.activeTool = session.activeTool === button.dataset.tool ? "pointer" : button.dataset.tool;
+    document.querySelectorAll("[data-tool]").forEach((item) => item.classList.toggle("is-active", item.dataset.tool === session.activeTool));
+    updateCanvasMode();
+  }
+
+  function handleColorClick(event) {
+    const button = event.target.closest("[data-color]");
+    if (!button) return;
+    session.activeColor = button.dataset.color;
+    document.querySelectorAll("[data-color]").forEach((item) => item.classList.toggle("is-active", item === button));
+  }
+
+  function updateCanvasMode() {
+    const active = session.joined && session.role === "teacher" && session.view !== "home" && session.activeTool !== "pointer";
+    dom.pageAnnotationCanvas.classList.toggle("is-drawing", active);
+    document.body.classList.toggle("paper-overlay", active);
+    if (!active) session.currentStroke = null;
+  }
+
+  function resizeCanvas() {
+    const canvas = dom.pageAnnotationCanvas;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(window.innerWidth * dpr);
+    canvas.height = Math.round(window.innerHeight * dpr);
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    redrawCanvas();
+  }
+
+  function redrawCanvas(previewStroke) {
+    const canvas = dom.pageAnnotationCanvas;
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+    const all = [...((session.state?.strokes || {})[annotationKey()] || [])];
+    if (previewStroke) all.push(previewStroke);
+    all.forEach((stroke) => drawStroke(ctx, stroke));
+  }
+
+  function drawStroke(ctx, stroke) {
+    if (!stroke.points || stroke.points.length < 2) return;
+    ctx.save();
+    ctx.lineCap = stroke.mode === "highlighter" ? "butt" : "round";
+    ctx.lineJoin = stroke.mode === "highlighter" ? "bevel" : "round";
+    ctx.globalAlpha = stroke.mode === "highlighter" ? 0.32 : 1;
+    ctx.globalCompositeOperation = "source-over";
+    ctx.strokeStyle = stroke.color || "#b83b35";
+    ctx.lineWidth = stroke.mode === "highlighter" ? 22 : Number(stroke.width || 3);
+    ctx.beginPath();
+    stroke.points.forEach((point, index) => {
+      const x = point.x * window.innerWidth;
+      const y = point.y * window.innerHeight;
+      if (index === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function canvasPoint(event) {
+    return {
+      x: Math.max(0, Math.min(1, event.clientX / window.innerWidth)),
+      y: Math.max(0, Math.min(1, event.clientY / window.innerHeight))
+    };
+  }
+
+  function startStroke(event) {
+    if (!dom.pageAnnotationCanvas.classList.contains("is-drawing")) return;
+    event.preventDefault();
+    dom.pageAnnotationCanvas.setPointerCapture(event.pointerId);
+    if (session.activeTool === "eraser") {
+      session.erasing = true;
+      session.erasedStrokeIds = new Set();
+      eraseAt(event);
+      return;
+    }
+    session.currentStroke = {
+      id: `stroke-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      mode: session.activeTool,
+      color: session.activeColor,
+      width: session.activeTool === "highlighter" ? 22 : 3,
+      points: [canvasPoint(event)]
+    };
+  }
+
+  function extendStroke(event) {
+    if (session.erasing) {
+      event.preventDefault();
+      eraseAt(event);
+      return;
+    }
+    if (!session.currentStroke) return;
+    event.preventDefault();
+    session.currentStroke.points.push(canvasPoint(event));
+    redrawCanvas(session.currentStroke);
+  }
+
+  async function finishStroke(event) {
+    if (session.erasing) {
+      session.erasing = false;
+      const strokeIds = [...session.erasedStrokeIds];
+      session.erasedStrokeIds = new Set();
+      if (strokeIds.length) {
+        await performAction("eraseStrokes", { strokeKey: annotationKey(), strokeIds });
+      }
+      return;
+    }
+    if (!session.currentStroke) return;
+    event.preventDefault();
+    const stroke = session.currentStroke;
+    session.currentStroke = null;
+    if (stroke.points.length < 2) return;
+    await performAction("addStroke", { stroke, strokeKey: annotationKey() });
+  }
+
+  function eraseAt(event) {
+    const point = canvasPoint(event);
+    const key = annotationKey();
+    const strokes = (session.state?.strokes || {})[key] || [];
+    const radius = 0.025;
+    const survivors = strokes.filter((stroke) => {
+      const hit = (stroke.points || []).some((candidate) => {
+        const dx = candidate.x - point.x;
+        const dy = candidate.y - point.y;
+        return Math.sqrt(dx * dx + dy * dy) < radius;
+      });
+      if (hit) session.erasedStrokeIds.add(String(stroke.id));
+      return !hit;
+    });
+    if (session.state && session.state.strokes) session.state.strokes[key] = survivors;
+    redrawCanvas();
+  }
+
+  async function clearStrokes() {
+    if (session.role !== "teacher") return;
+    const key = annotationKey();
+    if (session.state?.strokes) session.state.strokes[key] = [];
+    redrawCanvas();
+    await performAction("clearStrokes", { strokeKey: key });
+  }
+
+  function init() {
+    cacheDom();
+    bindEvents();
+    applySavedCover();
+    const params = new URLSearchParams(location.search);
+    const hashParams = new URLSearchParams(location.hash.replace(/^#/, ""));
+    const getParam = (key) => params.get(key) || hashParams.get(key);
+    if (getParam("room")) dom.roomInput.value = getParam("room").toUpperCase();
+    if (getParam("role") === "student") {
+      session.role = "student";
+      document.querySelectorAll(".role-card").forEach((item) => item.classList.toggle("is-active", item.dataset.role === "student"));
+      dom.nameInput.value = getParam("name") || "学生";
+    } else if (getParam("name")) {
+      dom.nameInput.value = getParam("name");
+    }
+    session.pendingModule = getParam("module") || "read";
+    resizeCanvas();
+    if (getParam("auto") === "1") setTimeout(joinClassroom, 0);
+  }
+
+  document.addEventListener("DOMContentLoaded", init);
+})();
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
