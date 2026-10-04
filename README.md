@@ -1,4 +1,6 @@
-﻿# 像素词汇农场
+﻿[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https%3A%2F%2Fgithub.com%2FZhangjiayi-momo%2Fpixel-word-farm)
+
+# 像素词汇农场
 
 面向高考核心词汇周测的教师主控互动课堂。当前版本保持首页、三子页、固定侧栏和全页批注架构不变，并增量加入封面替换、新词选择、多题型默写和橡皮擦。
 
@@ -228,4 +230,5 @@ powershell -ExecutionPolicy Bypass -File .\start-public-tunnel.ps1
 
 - 拼写补全：保留首尾字母，随机挖空内部字母，并显示词性和中文释义。
 - 单词-汉译连线：左侧单词使用 1、2、3、4 编号，右侧汉意打乱并使用 A、B、C、D 顺序编号，底部答题卡录入对应字母。
+
 
