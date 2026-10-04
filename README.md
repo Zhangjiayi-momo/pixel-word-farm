@@ -1,4 +1,6 @@
-﻿[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https%3A%2F%2Fgithub.com%2FZhangjiayi-momo%2Fpixel-word-farm)
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/Zhangjiayi-momo/pixel-word-farm)
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https%3A%2F%2Fgithub.com%2FZhangjiayi-momo%2Fpixel-word-farm)
 
 # 像素词汇农场
 
