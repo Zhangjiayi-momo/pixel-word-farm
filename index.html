@@ -1,16 +1,55 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#4a8d59">
   <title>像素词汇农场</title>
-  <link rel="stylesheet" href="styles.css?v=20261004-3">
+<style id="boot-styles">
+    html, body { margin: 0; min-height: 100%; }
+    body:not(.app-ready) .home-screen,
+    body:not(.app-ready) .app-root { visibility: hidden; }
+    .boot-screen { position: fixed; z-index: 99999; inset: 0; display: grid; place-items: center; overflow: hidden; color: #33271f; font-family: "Microsoft YaHei", sans-serif; background: #8ccfe9; }
+    .boot-scene { position: absolute; inset: 0; image-rendering: pixelated; }
+    .boot-sun { position: absolute; top: 9%; left: 72%; width: 110px; height: 110px; background: #ffd66f; box-shadow: 0 0 0 16px rgba(255,238,164,.28); }
+    .boot-cloud { position: absolute; width: 96px; height: 28px; background: #fff8df; box-shadow: 18px -18px 0 #fff8df, 44px -4px 0 #fff8df; }
+    .boot-cloud.one { top: 16%; left: 10%; }
+    .boot-cloud.two { top: 24%; right: 10%; transform: scale(.75); }
+    .boot-hills { position: absolute; right: -10%; bottom: 24%; left: -10%; height: 34%; background: #75ad4b; border-radius: 50% 50% 0 0; }
+    .boot-soil { position: absolute; right: 0; bottom: 0; left: 0; height: 28%; background: #7b5135; box-shadow: inset 0 12px 0 #5f963d; }
+    .boot-sprout { position: absolute; bottom: 29%; left: calc(50% - 9px); width: 18px; height: 72px; background: #2b6f4b; box-shadow: -22px -12px 0 #6daa45, 22px -24px 0 #8bc85b; animation: boot-bob .8s steps(2, end) infinite; }
+    .boot-card { position: relative; z-index: 2; width: min(430px, calc(100vw - 30px)); padding: 25px; text-align: center; background: #f6e8bd; border: 5px solid #5b3827; box-shadow: 9px 9px 0 rgba(51,39,31,.3); }
+    .boot-card .boot-eyebrow { margin: 0; color: #b83b35; font-family: Consolas, monospace; font-size: 11px; font-weight: 800; letter-spacing: .16em; }
+    .boot-card h1 { margin: 11px 0 18px; font-size: 25px; }
+    .boot-track { height: 18px; padding: 3px; background: #d8bd82; border: 3px solid #5b3827; }
+    .boot-track span { display: block; width: 0; height: 100%; background: #2b6f4b; transition: width .18s steps(4, end); }
+    .boot-progress-text { margin: 12px 0 0; color: #6f5139; font-family: Consolas, monospace; font-size: 12px; }
+    body.app-ready .boot-screen { opacity: 0; visibility: hidden; transition: opacity .25s ease, visibility .25s ease; }
+    @keyframes boot-bob { 50% { transform: translateY(-8px); } }
+    @media (prefers-reduced-motion: reduce) { .boot-sprout { animation: none; } }
+  </style>
+  <link rel="stylesheet" href="styles.css?v=20261005-1">
 </head>
-<body>
+<body class="resources-loading">
+  <div id="loadingScreen" class="boot-screen" role="status" aria-live="polite">
+    <div class="boot-scene" aria-hidden="true">
+      <div class="boot-sun"></div>
+      <div class="boot-cloud one"></div>
+      <div class="boot-cloud two"></div>
+      <div class="boot-hills"></div>
+      <div class="boot-soil"></div>
+      <div class="boot-sprout"></div>
+    </div>
+    <div class="boot-card">
+      <p class="boot-eyebrow">GATHERING WORD SEEDS</p>
+      <h1>正在装载词汇农场</h1>
+      <div class="boot-track"><span id="bootProgressBar"></span></div>
+      <p id="bootProgressText" class="boot-progress-text">正在检查资源 0%</p>
+    </div>
+  </div>
   <section id="homeScreen" class="home-screen">
     <div class="cover-frame">
-      <img id="coverImage" class="cover-image" src="assets/farm-cover.png" alt="暖阳、小木屋、花海和师生劳作的像素农场封面">
+      <img id="coverImage" class="cover-image" src="assets/farm-cover.webp" data-fallback="assets/farm-cover.jpg" width="1920" height="1080" decoding="async" fetchpriority="high" alt="暖阳、小木屋、花海和师生劳作的像素农场封面">
       <div class="cover-vignette" aria-hidden="true"></div>
 
       <div class="home-session">
@@ -266,7 +305,7 @@
   </dialog>
 
   <script src="data.js?v=20261004-2"></script>
-  <script src="app.js?v=20261004-4"></script>
+  <script src="app.js?v=20261005-2"></script>
 </body>
 </html>
 

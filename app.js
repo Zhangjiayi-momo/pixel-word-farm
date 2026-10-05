@@ -1,4 +1,4 @@
-﻿(function () {
+(function () {
   "use strict";
 
   const SEED_WORDS = window.WORD_DATA || [];
@@ -6,6 +6,9 @@
   const PROGRESS_KEY = "wordMemoryCoach.progress.v3";
   const OFFLINE_KEY = "wordMemoryCoach.offlineRoom.v3";
   const COVER_KEY = "wordMemoryCoach.coverImage.v1";
+  const DEFAULT_COVER = "assets/farm-cover.webp";
+  const FALLBACK_COVER = "assets/farm-cover.jpg";
+  const COVER_PLACEHOLDER = "assets/farm-cover-placeholder.svg";
   const MODULES = {
     read: { phase: 1, title: "读音浇灌", eyebrow: "READ ALOUD" },
     understand: { phase: 2, title: "理解施肥", eyebrow: "UNDERSTAND" },
@@ -78,6 +81,7 @@
 
   function cacheDom() {
     [
+      "loadingScreen", "bootProgressBar", "bootProgressText",
       "homeScreen", "appRoot", "coverImage", "coverImageInput", "uploadCoverButton",
       "resetCoverButton", "homeConnectionButton", "homeSessionLabel", "homeButton",
       "connectionStatus", "roomLabel", "copyInviteButton", "uploadButton", "leaveButton",
@@ -103,6 +107,7 @@
     dom.uploadCoverButton.addEventListener("click", () => dom.coverImageInput.click());
     dom.coverImageInput.addEventListener("change", handleCoverImage);
     dom.resetCoverButton.addEventListener("click", resetCoverImage);
+    dom.coverImage.addEventListener("error", handleCoverImageError);
     dom.homeButton.addEventListener("click", showHome);
     document.querySelectorAll(".role-card").forEach((button) => {
       button.addEventListener("click", () => {
@@ -189,7 +194,7 @@
         const dataUrl = canvas.toDataURL("image/jpeg", 0.88);
         try {
           localStorage.setItem(COVER_KEY, dataUrl);
-          dom.coverImage.src = dataUrl;
+          setCoverImage(dataUrl, { fallback: FALLBACK_COVER });
         } catch (error) {
           alert("图片压缩后仍无法保存，请换一张尺寸更小的图片。");
         }
@@ -201,18 +206,110 @@
     reader.readAsDataURL(file);
   }
 
+  function setCoverImage(source, options = {}) {
+    const fallback = options.fallback || FALLBACK_COVER;
+    dom.coverImage.dataset.fallback = fallback;
+    dom.coverImage.dataset.fallbackActive = "";
+    dom.coverImage.src = source;
+  }
+
+  function handleCoverImageError() {
+    const fallback = dom.coverImage.dataset.fallback || FALLBACK_COVER;
+    const fallbackActive = dom.coverImage.dataset.fallbackActive === "true";
+    if (fallback && fallback !== dom.coverImage.getAttribute("src") && !fallbackActive) {
+      dom.coverImage.dataset.fallbackActive = "true";
+      dom.coverImage.src = fallback;
+      return;
+    }
+    if (dom.coverImage.getAttribute("src") !== COVER_PLACEHOLDER) {
+      dom.coverImage.src = COVER_PLACEHOLDER;
+    }
+  }
+
   function resetCoverImage() {
     try { localStorage.removeItem(COVER_KEY); } catch (error) { console.warn(error); }
-    dom.coverImage.src = "assets/farm-cover.png";
+    setCoverImage(DEFAULT_COVER, { fallback: FALLBACK_COVER });
   }
 
   function applySavedCover() {
     try {
       const saved = localStorage.getItem(COVER_KEY);
-      if (saved) dom.coverImage.src = saved;
+      if (saved) setCoverImage(saved, { fallback: FALLBACK_COVER });
     } catch (error) {
       console.warn(error);
     }
+  }
+
+  function loadImageOnce(source) {
+    return new Promise((resolve) => {
+      const image = new Image();
+      let settled = false;
+      let timeoutId = null;
+      const finish = (loaded) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timeoutId);
+        image.onload = null;
+        image.onerror = null;
+        resolve(loaded);
+      };
+      timeoutId = window.setTimeout(() => finish(false), 15000);
+      image.onload = () => finish(true);
+      image.onerror = () => finish(false);
+      image.decoding = "async";
+      image.src = source;
+    });
+  }
+
+  async function preloadImage(source, retries = 2) {
+    for (let attempt = 0; attempt <= retries; attempt += 1) {
+      if (await loadImageOnce(source)) return true;
+      if (attempt < retries) {
+        await new Promise((resolve) => window.setTimeout(resolve, 450 * (attempt + 1)));
+      }
+    }
+    return false;
+  }
+
+  async function preloadCover(source, fallback) {
+    if (await preloadImage(source, 2)) return source;
+    if (fallback && fallback !== source && await preloadImage(fallback, 2)) return fallback;
+    return COVER_PLACEHOLDER;
+  }
+
+  function updateBootProgress(completed, total, label) {
+    const percent = total ? Math.min(100, Math.round((completed / total) * 100)) : 100;
+    if (dom.bootProgressBar) dom.bootProgressBar.style.width = `${percent}%`;
+    if (dom.bootProgressText) {
+      dom.bootProgressText.textContent = percent >= 100
+        ? "资源装载完成，正在进入农场…"
+        : `正在装载${label} ${percent}%`;
+    }
+  }
+
+  async function preloadApplicationResources() {
+    const source = dom.coverImage.getAttribute("src") || DEFAULT_COVER;
+    const fallback = dom.coverImage.dataset.fallback || FALLBACK_COVER;
+    const total = 2;
+    let completed = 0;
+    const reportProgress = (label) => {
+      completed += 1;
+      updateBootProgress(completed, total, label);
+    };
+
+    updateBootProgress(0, total, "资源");
+    const [coverSource] = await Promise.all([
+      preloadCover(source, fallback).then((resolvedSource) => {
+        reportProgress("封面");
+        return resolvedSource;
+      }),
+      preloadImage(COVER_PLACEHOLDER, 2).then((loaded) => {
+        reportProgress("像素素材");
+        return loaded;
+      })
+    ]);
+
+    setCoverImage(coverSource, { fallback });
   }
   function openJoinDialog(moduleName) {
     session.pendingModule = moduleName || "read";
@@ -1738,10 +1835,18 @@
     await performAction("clearStrokes", { strokeKey: key });
   }
 
-  function init() {
+  async function init() {
     cacheDom();
     bindEvents();
     applySavedCover();
+
+    try {
+      await preloadApplicationResources();
+    } catch (error) {
+      console.error("静态资源预加载失败，继续进入页面", error);
+      updateBootProgress(2, 2, "资源");
+    }
+
     const params = new URLSearchParams(location.search);
     const hashParams = new URLSearchParams(location.hash.replace(/^#/, ""));
     const getParam = (key) => params.get(key) || hashParams.get(key);
@@ -1755,6 +1860,8 @@
     }
     session.pendingModule = getParam("module") || "read";
     resizeCanvas();
+    document.body.classList.remove("resources-loading");
+    document.body.classList.add("app-ready");
     if (getParam("auto") === "1") setTimeout(joinClassroom, 0);
   }
 
