@@ -28,6 +28,7 @@
     offline: false,
     state: null,
     pollingTimer: null,
+    pollingBusy: false,
     readTimer: null,
     activeTool: "pointer",
     activeColor: "#b83b35",
@@ -40,6 +41,7 @@
     selectedSpellIds: new Set(),
     previewTask: null,
     teacherShowAnswer: false,
+    enrichmentToken: 0,
     progress: readJson(PROGRESS_KEY, {})
   };
 
@@ -327,8 +329,13 @@
       enterModule(moduleName);
       return;
     }
-    await performAction("setPhase", { phase: MODULES[moduleName].phase });
+    const phase = MODULES[moduleName].phase;
+    if (session.state) session.state.phase = phase;
     enterModule(moduleName);
+    void sendAction("setPhase", { phase }, false).catch((error) => {
+      console.warn("模块同步失败，已保留本地切换", error);
+      setConnectionStatus("同步中断", false);
+    });
   }
 
   async function joinClassroom() {
@@ -350,7 +357,12 @@
     dom.joinDialog.close();
     dom.homeSessionLabel.textContent = `${session.role === "teacher" ? "教师" : "学生"} · ${session.room}`;
     if (session.role === "teacher") {
-      await performAction("setPhase", { phase: MODULES[session.pendingModule].phase });
+      const phase = MODULES[session.pendingModule].phase;
+      if (session.state) session.state.phase = phase;
+      void sendAction("setPhase", { phase }, false).catch((error) => {
+        console.warn("初始模块同步失败", error);
+        setConnectionStatus("同步中断", false);
+      });
     }
     const initialModule = session.pendingModule || phaseToModule(Number(session.state.phase));
     enterModule(initialModule);
@@ -447,30 +459,35 @@
 
   function startPolling() {
     if (session.offline || session.pollingTimer) return;
-    session.pollingTimer = setInterval(refreshState, 750);
+    session.pollingTimer = setInterval(refreshState, 1000);
   }
 
   async function refreshState() {
-    if (session.offline || !session.joined) return;
+    if (session.offline || !session.joined || session.pollingBusy || document.visibilityState === "hidden") return;
+    session.pollingBusy = true;
     try {
-      const state = await requestState();
-      const changed = !session.state || state.version !== session.state.version;
+      const state = await requestState(session.state?.version);
+      if (!state) return;
       session.state = state;
       session.connected = true;
       setConnectionStatus("在线同步", true);
-      if (changed) {
-        renderAll();
-      }
+      renderAll();
     } catch (error) {
       session.connected = false;
       setConnectionStatus("同步中断", false);
+    } finally {
+      session.pollingBusy = false;
     }
   }
 
-  async function requestState() {
-    const response = await fetch(`/api/state?room=${encodeURIComponent(session.room)}`, { cache: "no-store" });
+  async function requestState(sinceVersion = null) {
+    let url = `/api/state?room=${encodeURIComponent(session.room)}`;
+    if (Number.isInteger(sinceVersion)) url += `&since=${encodeURIComponent(sinceVersion)}`;
+    const response = await fetch(url, { cache: "no-store" });
     if (!response.ok) throw new Error(`状态请求失败：${response.status}`);
-    return response.json();
+    const payload = await response.json();
+    if (Number.isInteger(sinceVersion) && payload.changed === false) return null;
+    return payload.state || payload;
   }
 
   async function sendAction(action, payload, rerender = true) {
@@ -628,9 +645,9 @@
     if (!session.state || !session.joined || session.view === "home") return;
     renderDayNav();
     renderWordList();
-    renderReadGrid();
-    renderUnderstandingList();
-    renderSpellView();
+    if (session.view === "read") renderReadGrid();
+    if (session.view === "understand") renderUnderstandingList();
+    if (session.view === "spell") renderSpellView();
     renderSubmissions();
     updateHeaderStats();
     updateCanvasMode();
@@ -683,6 +700,9 @@
     if (session.role !== "teacher") return;
     const bankId = dom.wordBankSelect.value;
     if (!bankId || bankId === session.state.activeBankId) return;
+    session.enrichmentToken += 1;
+    dom.enrichCurrentWordsButton.disabled = false;
+    dom.enrichCurrentWordsButton.textContent = "智能补全当前词库";
     await performAction("loadWordBank", { bankId });
   }
 
@@ -713,31 +733,6 @@
         <button class="mini-speaker" data-speak-id="${escapeHtml(word.id)}" type="button" aria-label="播放 ${escapeHtml(word.word)} 的发音">🔊</button>
       </article>`;
     }).join("");
-    bindReadSpeakers();
-  }
-
-  function bindReadSpeakers() {
-    dom.readWordGrid.querySelectorAll("[data-speak-id]").forEach((button) => {
-      button.addEventListener("click", async (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        const word = (session.state.words || []).find((item) => item.id === button.dataset.speakId);
-        if (!word) return;
-        button.classList.add("is-loading");
-        button.disabled = true;
-        button.textContent = "…";
-        try {
-          const started = await speakWord(word, { waitForEnd: false });
-          button.dataset.lastResult = started ? "playing" : "failed";
-        } catch (error) {
-          button.dataset.lastResult = "failed";
-        } finally {
-          button.classList.remove("is-loading");
-          button.disabled = false;
-          button.textContent = "🔊";
-        }
-      });
-    });
   }
 
   function renderUnderstandingList() {
@@ -1111,11 +1106,26 @@
     return next;
   }
 
-  function handleReadGridClick(event) {
+  async function handleReadGridClick(event) {
     const speaker = event.target.closest("[data-speak-id]");
     if (speaker) {
+      event.preventDefault();
+      event.stopPropagation();
       const word = (session.state.words || []).find((item) => item.id === speaker.dataset.speakId);
-      speakWord(word);
+      if (!word) return;
+      speaker.classList.add("is-loading");
+      speaker.disabled = true;
+      speaker.textContent = "…";
+      try {
+        const started = await speakWord(word, { waitForEnd: false });
+        speaker.dataset.lastResult = started ? "playing" : "failed";
+      } catch (error) {
+        speaker.dataset.lastResult = "failed";
+      } finally {
+        speaker.classList.remove("is-loading");
+        speaker.disabled = false;
+        speaker.textContent = "🔊";
+      }
       return;
     }
     const tile = event.target.closest("[data-word-id]");
@@ -1612,15 +1622,19 @@
 
   async function enrichCurrentWordBank() {
     if (session.role !== "teacher" || !session.state) return;
+    const token = session.enrichmentToken + 1;
+    session.enrichmentToken = token;
     const originalText = dom.enrichCurrentWordsButton.textContent;
+    const batchName = session.state.batchName || "智能补全词库";
     dom.enrichCurrentWordsButton.disabled = true;
     dom.enrichCurrentWordsButton.textContent = "智能补全中…";
     try {
-      const enriched = await enrichVocabulary(session.state.words || [], true);
-      await sendAction("replaceWords", {
-        words: enriched,
-        batchName: session.state.batchName || "智能补全词库"
-      }, false);
+      const enriched = await enrichVocabulary(session.state.words || [], true, (start, end, total) => {
+        if (token === session.enrichmentToken) dom.enrichCurrentWordsButton.textContent = `智能补全 ${end}/${total}`;
+      });
+      if (token !== session.enrichmentToken || session.state?.batchName !== batchName) return;
+      await sendAction("mergeEnrichment", { words: enriched, batchName }, false);
+      if (token !== session.enrichmentToken) return;
       renderAll();
       dom.enrichCurrentWordsButton.textContent = "补全完成";
     } catch (error) {
@@ -1629,12 +1643,14 @@
       dom.enrichCurrentWordsButton.textContent = "补全失败，请重试";
     } finally {
       setTimeout(() => {
+        if (token !== session.enrichmentToken) return;
         dom.enrichCurrentWordsButton.disabled = false;
         dom.enrichCurrentWordsButton.textContent = originalText;
       }, 1800);
     }
   }
-  async function enrichVocabulary(words, force = false) {
+
+  async function enrichVocabulary(words, force = false, onProgress = null) {
     if (!force && (!dom.autoEnrich || !dom.autoEnrich.checked)) return words;
     if (location.protocol === "file:") {
       dom.uploadPreview.textContent = "单机模式跳过联网补全，仍会导入基础词汇。";
@@ -1646,6 +1662,7 @@
       const chunk = words.slice(start, start + chunkSize);
       const end = Math.min(start + chunk.length, words.length);
       dom.uploadPreview.textContent = `正在联网补充 ${start + 1}–${end} / ${words.length}……`;
+      if (typeof onProgress === "function") onProgress(start + 1, end, words.length);
       const response = await fetch("/api/enrich-batch", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1661,22 +1678,51 @@
     return enriched;
   }
 
+  async function enrichWordsInBackground(words, batchName, token, originalText) {
+    try {
+      const enriched = await enrichVocabulary(words, true, (start, end, total) => {
+        if (token === session.enrichmentToken) dom.enrichCurrentWordsButton.textContent = `后台补全 ${end}/${total}`;
+      });
+      if (token !== session.enrichmentToken || session.state?.batchName !== batchName) return;
+      await sendAction("mergeEnrichment", { words: enriched, batchName }, false);
+      if (token !== session.enrichmentToken) return;
+      renderAll();
+      dom.enrichCurrentWordsButton.textContent = "智能补全完成";
+    } catch (error) {
+      console.warn("后台智能补全失败", error);
+      if (token === session.enrichmentToken) dom.enrichCurrentWordsButton.textContent = "补全失败，可重试";
+    } finally {
+      if (token === session.enrichmentToken) {
+        dom.enrichCurrentWordsButton.disabled = false;
+        setTimeout(() => {
+          if (token === session.enrichmentToken) dom.enrichCurrentWordsButton.textContent = originalText;
+        }, 2200);
+      }
+    }
+  }
+
   async function confirmUpload() {
     if (!dom.confirmUpload) return;
     dom.confirmUpload.disabled = true;
     try {
-      let words = parseVocabularyText(dom.uploadText.value);
+      const words = parseVocabularyText(dom.uploadText.value);
       if (!words.length) throw new Error("没有可导入的单词");
-      try {
-        words = await enrichVocabulary(words);
-      } catch (error) {
-        console.warn(error);
-        dom.uploadPreview.textContent = "在线补全失败，已保留原始词条，导入后仍可继续学习。";
-      }
       const batchName = `今日词库 ${new Date().toLocaleDateString("zh-CN")}`;
+      const shouldEnrich = !session.offline && location.protocol !== "file:" && Boolean(dom.autoEnrich?.checked);
+      const token = session.enrichmentToken + 1;
+      session.enrichmentToken = token;
+      const originalText = "智能补全当前词库";
       await sendAction("replaceWords", { words, batchName }, false);
       dom.uploadDialog.close();
       renderAll();
+      if (shouldEnrich) {
+        dom.enrichCurrentWordsButton.disabled = true;
+        dom.enrichCurrentWordsButton.textContent = "后台补全中…";
+        void enrichWordsInBackground(words, batchName, token, originalText);
+      } else {
+        dom.enrichCurrentWordsButton.disabled = false;
+        dom.enrichCurrentWordsButton.textContent = originalText;
+      }
     } catch (error) {
       alert(`导入失败：${error.message}`);
     } finally {

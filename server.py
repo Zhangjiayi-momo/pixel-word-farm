@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """高考词汇互动课堂的轻量级房间同步与内容补全服务。"""
 
 from __future__ import annotations
@@ -250,7 +250,7 @@ def apply_action(state: dict, role: str, client_id: str, action: str, payload: d
         return False, "无效角色"
     teacher_only = {
         "setPhase", "setDay", "setWord", "replaceWords", "loadWordBank", "addStroke", "clearStrokes",
-        "eraseStrokes", "publishSpellTask", "setSpellAnswerVisibility", "teacherFeedback", "gradeItem", "publishGrades", "resetRoom"
+        "eraseStrokes", "mergeEnrichment", "publishSpellTask", "setSpellAnswerVisibility", "teacherFeedback", "gradeItem", "publishGrades", "resetRoom"
     }
     if role != "teacher" and action in teacher_only:
         return False, "该操作仅允许教师端执行"
@@ -341,6 +341,37 @@ def apply_action(state: dict, role: str, client_id: str, action: str, payload: d
         state["showSpellAnswers"] = False
         for student in state["students"].values():
             student.update({"answer": "", "answers": [], "itemResults": {}, "submittedAt": None, "status": "idle", "correct": None, "feedback": ""})
+        return True, ""
+
+    if action == "mergeEnrichment":
+        raw_words = payload.get("words")
+        if not isinstance(raw_words, list) or not raw_words:
+            return False, "补全结果不能为空"
+        updates = {}
+        for index, item in enumerate(raw_words[:5000]):
+            if not isinstance(item, dict):
+                continue
+            normalized = normalize_word(item, index)
+            updates[normalized["id"]] = normalized
+        if not updates:
+            return False, "补全结果无效"
+        for index, current in enumerate(state.get("words", [])):
+            enriched = updates.get(str(current.get("id") or ""))
+            if not enriched:
+                continue
+            preserved = {"id": current.get("id"), "day": current.get("day"), "word": current.get("word")}
+            state["words"][index] = {**current, **enriched, **preserved}
+        for bank in state.get("wordBanks", []):
+            if not isinstance(bank, dict) or not isinstance(bank.get("words"), list):
+                continue
+            for index, current in enumerate(bank["words"]):
+                if not isinstance(current, dict):
+                    continue
+                enriched = updates.get(str(current.get("id") or ""))
+                if not enriched:
+                    continue
+                preserved = {"id": current.get("id"), "day": current.get("day"), "word": current.get("word")}
+                bank["words"][index] = {**current, **enriched, **preserved}
         return True, ""
 
     if action == "addStroke":
@@ -885,7 +916,7 @@ def enrich_words_batch(words: list[dict]) -> list[dict]:
 
 
 class ClassroomHandler(SimpleHTTPRequestHandler):
-    server_version = "WordMemoryClassroom/1.2"
+    server_version = "WordMemoryClassroom/1.3"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
@@ -939,10 +970,22 @@ class ClassroomHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/state":
             query = parse_qs(parsed.query)
             room_id = sanitize_room_id((query.get("room") or [None])[0])
+            raw_since = (query.get("since") or [None])[0]
+            try:
+                since_version = int(raw_since) if raw_since is not None else None
+            except (TypeError, ValueError):
+                since_version = None
             with STATE_LOCK:
                 state = load_room(room_id)
-                save_room(state)
-                self.send_json(deepcopy(state))
+                if since_version is not None and since_version == state["version"]:
+                    self.send_json({"ok": True, "changed": False, "version": state["version"]})
+                else:
+                    self.send_json({
+                        "ok": True,
+                        "changed": True,
+                        "version": state["version"],
+                        "state": deepcopy(state)
+                    })
             return
         super().do_GET()
 
