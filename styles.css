@@ -1,4 +1,4 @@
-﻿:root {
+:root {
   --sky: #8ccfe9;
   --grass: #6ca746;
   --leaf: #2b6f4b;
@@ -351,4 +351,16 @@ body.role-student .teacher-only { display: none !important; }
 .matching-answer-row { display: flex; align-items: center; gap: 7px; padding: 8px; background: #fff9df; border: 2px solid #bd955a; }
 .matching-answer-row b { min-width: 34px; font-family: var(--font-pixel); }
 .matching-answer-row input { width: 62px; padding: 7px; color: var(--ink); font-family: var(--font-pixel); font-size: 17px; text-align: center; background: #fff; border: 3px solid var(--line); }
-
+/* 历史词库管理 */
+.bank-manager-shell { padding: 20px; }
+.bank-manager-hint { margin: 0 0 12px; color: #71543c; font-size: 12px; line-height: 1.6; }
+.bank-manager-list { display: grid; gap: 8px; max-height: 58vh; overflow: auto; padding-right: 3px; }
+.bank-manager-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 10px; background: #fff1c6; border: 3px solid #a97945; }
+.bank-manager-row.is-active { background: #e2f2bd; border-color: #4e8652; }
+.bank-manager-copy strong, .bank-manager-copy small { display: block; }
+.bank-manager-copy strong { font-family: var(--font-pixel); font-size: 13px; }
+.bank-manager-copy small { margin-top: 4px; color: #735c49; font-size: 11px; }
+.bank-manager-actions { display: flex; gap: 6px; }
+.bank-manager-actions .pixel-button { min-height: 32px; padding: 6px 9px; font-size: 10px; }
+.bank-manager-actions .danger { color: #fff9df; background: #82472f; }
+.bank-manager-empty { padding: 18px; text-align: center; background: rgba(255,255,255,.35); border: 2px dashed #a97945; }

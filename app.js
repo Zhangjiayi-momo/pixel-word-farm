@@ -92,7 +92,8 @@
       "connectionStatus", "roomLabel", "copyInviteButton", "uploadButton", "leaveButton",
       "joinDialog", "roomInput", "nameInput", "joinButton", "uploadDialog", "wordFileInput",
       "uploadText", "uploadPreview", "autoEnrich", "cancelUpload", "confirmUpload", "dayNav", "dayWordList",
-      "dailyPendingCount", "weekProgressText", "wordListCount", "wordBankLabel", "enrichCurrentWordsButton", "wordBankSelect", "loadWordBankButton",
+      "dailyPendingCount", "weekProgressText", "wordListCount", "wordBankLabel", "enrichCurrentWordsButton", "wordBankSelect", "loadWordBankButton", "manageWordBanksButton",
+      "bankManagerDialog", "bankManagerList", "closeBankManagerButton",
       "activeDayLabel", "moduleEyebrow", "moduleTitle", "wordPosition", "studentCount",
       "readView", "readWordGrid", "readQueueButton", "previousWord", "nextWord",
       "understandView", "understandingList", "spellView", "spellSelectedCount",
@@ -128,6 +129,9 @@
       if (button) selectDay(Number(button.dataset.day));
     });
     dom.loadWordBankButton.addEventListener("click", loadSelectedWordBank);
+    dom.manageWordBanksButton.addEventListener("click", openBankManager);
+    dom.closeBankManagerButton.addEventListener("click", () => dom.bankManagerDialog.close());
+    dom.bankManagerList.addEventListener("click", handleBankManagerClick);
     dom.dayWordList.addEventListener("click", (event) => {
       const button = event.target.closest("[data-word-id]");
       if (button) selectWord(button.dataset.wordId);
@@ -561,6 +565,28 @@
         state.showSpellAnswers = false;
       }
     }
+    if (action === "deleteWordBank") {
+      const banks = state.wordBanks || [];
+      const bank = banks.find((item) => item.id === payload.bankId);
+      if (bank && bank.id !== "seed" && bank.name !== "种子词库") {
+        const remaining = banks.filter((item) => item.id !== bank.id);
+        if (remaining.length) {
+          state.wordBanks = remaining;
+          if (state.activeBankId === bank.id) {
+            const replacement = remaining[remaining.length - 1];
+            state.words = structuredClone(replacement.words);
+            state.activeWordId = state.words[0]?.id || null;
+            state.activeDay = state.words[0]?.day || 1;
+            state.batchName = replacement.name;
+            state.batchDate = replacement.date;
+            state.newWordIds = state.words.map((word) => word.id);
+            state.activeBankId = replacement.id;
+            state.spellTask = null;
+            state.showSpellAnswers = false;
+          }
+        }
+      }
+    }
     if (action === "publishSpellTask") {
       state.spellTask = payload.task;
       state.showSpellAnswers = false;
@@ -683,30 +709,116 @@
     const done = words.filter((word) => session.progress[word.id]).length;
     dom.weekProgressText.textContent = `${done} / ${total}`;
     dom.wordListCount.textContent = `${total} 个`;
-    dom.wordBankLabel.textContent = session.state.batchName || (session.offline ? "本地词库" : "房间词库");
+    const bankEntries = bankDisplayEntries(session.state.wordBanks || []);
+    const activeBankEntry = bankEntries.find((entry) => entry.bank.id === session.state.activeBankId);
+    dom.wordBankLabel.textContent = activeBankEntry?.label || session.state.batchName || (session.offline ? "本地词库" : "房间词库");
     dom.activeDayLabel.textContent = session.state.activeDay || 1;
     renderWordBanks();
   }
 
+  function isSeedBank(bank) {
+    return bank?.id === "seed" || String(bank?.name || "") === "种子词库";
+  }
+
+  function formatBankDate(value) {
+    const raw = String(value || "").trim();
+    const fullMatch = raw.match(/(\d{4})-(\d{1,2})-(\d{1,2})/);
+    if (fullMatch) return `${fullMatch[2].padStart(2, "0")}-${fullMatch[3].padStart(2, "0")}`;
+    const shortMatch = raw.match(/(\d{1,2})[\/-](\d{1,2})/);
+    if (shortMatch) return `${shortMatch[1].padStart(2, "0")}-${shortMatch[2].padStart(2, "0")}`;
+    return raw || "日期未知";
+  }
+
+  function bankDisplayEntries(banks) {
+    let dayNumber = 0;
+    return (banks || []).map((bank, index) => {
+      const count = Array.isArray(bank.words) ? bank.words.length : 0;
+      if (isSeedBank(bank)) {
+        return { bank, index, dayNumber: 0, label: `种子词库 · ${formatBankDate(bank.date)} · ${count} 词` };
+      }
+      dayNumber += 1;
+      return { bank, index, dayNumber, label: `Day${dayNumber} · ${formatBankDate(bank.date)} · ${count} 词` };
+    });
+  }
+
   function renderWordBanks() {
     const banks = Array.isArray(session.state.wordBanks) ? session.state.wordBanks : [];
+    const entries = bankDisplayEntries(banks);
     const activeId = session.state.activeBankId || (banks.length ? banks[banks.length - 1].id : "");
-    dom.wordBankSelect.innerHTML = banks.slice().reverse().map((bank) => {
-      const label = `${bank.date || "日期未知"} · ${bank.name || "词库"} · ${bank.words?.length || 0} 词`;
+    dom.wordBankSelect.innerHTML = entries.slice().reverse().map(({ bank, label }) => {
       return `<option value="${escapeHtml(bank.id)}" ${bank.id === activeId ? "selected" : ""}>${escapeHtml(label)}</option>`;
     }).join("");
     dom.wordBankSelect.disabled = session.role !== "teacher" || !banks.length;
     dom.loadWordBankButton.disabled = session.role !== "teacher" || !banks.length;
+    dom.manageWordBanksButton.disabled = session.role !== "teacher" || !banks.length;
+    if (dom.bankManagerDialog?.open) renderBankManager();
   }
 
-  async function loadSelectedWordBank() {
-    if (session.role !== "teacher") return;
-    const bankId = dom.wordBankSelect.value;
-    if (!bankId || bankId === session.state.activeBankId) return;
+  function renderBankManager() {
+    const banks = Array.isArray(session.state?.wordBanks) ? session.state.wordBanks : [];
+    const entries = bankDisplayEntries(banks).slice().reverse();
+    if (!entries.length) {
+      dom.bankManagerList.innerHTML = `<div class="bank-manager-empty">暂无历史词库</div>`;
+      return;
+    }
+    dom.bankManagerList.innerHTML = entries.map(({ bank, label }) => {
+      const isActive = bank.id === session.state.activeBankId;
+      const canDelete = !isSeedBank(bank);
+      return `<article class="bank-manager-row${isActive ? " is-active" : ""}">
+        <div class="bank-manager-copy">
+          <strong>${escapeHtml(label)}</strong>
+          <small>${isActive ? "当前正在使用" : "点击“加载”切换到这个词库"}</small>
+        </div>
+        <div class="bank-manager-actions">
+          <button class="pixel-button" type="button" data-bank-load="${escapeHtml(bank.id)}" ${isActive ? "disabled" : ""}>${isActive ? "当前" : "加载"}</button>
+          <button class="pixel-button danger" type="button" data-bank-delete="${escapeHtml(bank.id)}" ${canDelete ? "" : "disabled"}>删除</button>
+        </div>
+      </article>`;
+    }).join("");
+  }
+
+  function openBankManager() {
+    if (session.role !== "teacher" || !session.state) return;
+    renderBankManager();
+    if (!dom.bankManagerDialog.open) dom.bankManagerDialog.showModal();
+  }
+
+  async function loadWordBankById(bankId) {
+    if (session.role !== "teacher" || !bankId || bankId === session.state.activeBankId) return;
     session.enrichmentToken += 1;
     dom.enrichCurrentWordsButton.disabled = false;
     dom.enrichCurrentWordsButton.textContent = "智能补全当前词库";
-    await performAction("loadWordBank", { bankId });
+    try {
+      await sendAction("loadWordBank", { bankId });
+      renderBankManager();
+    } catch (error) {
+      alert(`加载历史词库失败：${error.message}`);
+    }
+  }
+
+  async function loadSelectedWordBank() {
+    await loadWordBankById(dom.wordBankSelect.value);
+  }
+
+  async function handleBankManagerClick(event) {
+    const loadButton = event.target.closest("[data-bank-load]");
+    if (loadButton) {
+      await loadWordBankById(loadButton.dataset.bankLoad);
+      return;
+    }
+    const deleteButton = event.target.closest("[data-bank-delete]");
+    if (!deleteButton) return;
+    const bankId = deleteButton.dataset.bankDelete;
+    const bank = (session.state.wordBanks || []).find((item) => item.id === bankId);
+    if (!bank || isSeedBank(bank)) return;
+    const entry = bankDisplayEntries(session.state.wordBanks || []).find((item) => item.bank.id === bankId);
+    if (!confirm(`确定删除 ${entry?.label || "这个历史词库"}？删除后无法恢复。`)) return;
+    try {
+      await sendAction("deleteWordBank", { bankId }, true);
+      renderBankManager();
+    } catch (error) {
+      alert(`删除历史词库失败：${error.message}`);
+    }
   }
 
   function masked(value) {

@@ -250,7 +250,7 @@ def apply_action(state: dict, role: str, client_id: str, action: str, payload: d
         return False, "无效角色"
     teacher_only = {
         "setPhase", "setDay", "setWord", "replaceWords", "loadWordBank", "addStroke", "clearStrokes",
-        "eraseStrokes", "mergeEnrichment", "publishSpellTask", "setSpellAnswerVisibility", "teacherFeedback", "gradeItem", "publishGrades", "resetRoom"
+        "eraseStrokes", "mergeEnrichment", "deleteWordBank", "publishSpellTask", "setSpellAnswerVisibility", "teacherFeedback", "gradeItem", "publishGrades", "resetRoom"
     }
     if role != "teacher" and action in teacher_only:
         return False, "该操作仅允许教师端执行"
@@ -341,6 +341,39 @@ def apply_action(state: dict, role: str, client_id: str, action: str, payload: d
         state["showSpellAnswers"] = False
         for student in state["students"].values():
             student.update({"answer": "", "answers": [], "itemResults": {}, "submittedAt": None, "status": "idle", "correct": None, "feedback": ""})
+        return True, ""
+
+    if action == "deleteWordBank":
+        bank_id = str(payload.get("bankId") or "")
+        banks = state.get("wordBanks") if isinstance(state.get("wordBanks"), list) else []
+        target = next((bank for bank in banks if isinstance(bank, dict) and str(bank.get("id") or "") == bank_id), None)
+        if not target:
+            return False, "历史词库不存在"
+        if str(target.get("id") or "") == "seed" or str(target.get("name") or "") == "种子词库":
+            return False, "种子词库不能删除"
+        if len(banks) <= 1:
+            return False, "至少保留一个历史词库"
+        remaining = [bank for bank in banks if bank is not target]
+        if not remaining:
+            return False, "至少保留一个历史词库"
+        was_active = str(state.get("activeBankId") or "") == bank_id
+        replacement = remaining[-1] if was_active else None
+        replacement_words = [normalize_word(item, index) for index, item in enumerate(replacement.get("words") or [])] if replacement else []
+        if was_active and not replacement_words:
+            return False, "替代词库为空，无法删除当前词库"
+        state["wordBanks"] = remaining
+        if was_active:
+            state["words"] = replacement_words
+            state["activeDay"] = replacement_words[0]["day"]
+            state["activeWordId"] = replacement_words[0]["id"]
+            state["batchName"] = str(replacement.get("name") or "历史词库")[:80]
+            state["batchDate"] = str(replacement.get("date") or "")
+            state["newWordIds"] = [word["id"] for word in replacement_words]
+            state["activeBankId"] = str(replacement.get("id") or "")
+            state["spellTask"] = None
+            state["showSpellAnswers"] = False
+            for student in state.get("students", {}).values():
+                student.update({"answer": "", "answers": [], "itemResults": {}, "submittedAt": None, "status": "idle", "correct": None, "feedback": ""})
         return True, ""
 
     if action == "mergeEnrichment":
@@ -916,7 +949,7 @@ def enrich_words_batch(words: list[dict]) -> list[dict]:
 
 
 class ClassroomHandler(SimpleHTTPRequestHandler):
-    server_version = "WordMemoryClassroom/1.3"
+    server_version = "WordMemoryClassroom/1.4"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
