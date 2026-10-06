@@ -35,6 +35,9 @@
     currentStroke: null,
     readQueueRunning: false,
     activeAudio: null,
+    audioCache: new Map(),
+    audioPrefetchTimer: null,
+    audioPrefetchRun: 0,
     erasing: false,
     erasedStrokeIds: new Set(),
     lastRenderedWordId: null,
@@ -725,7 +728,8 @@
   }
 
   function renderReadGrid() {
-    dom.readWordGrid.innerHTML = visibleWords().map((word) => {
+    const words = visibleWords();
+    dom.readWordGrid.innerHTML = words.map((word) => {
       const active = word.id === session.state.activeWordId;
       return `<article class="read-word-tile${active ? " is-active" : ""}" data-word-id="${escapeHtml(word.id)}">
         <strong>${escapeHtml(word.word)}</strong>
@@ -733,6 +737,7 @@
         <button class="mini-speaker" data-speak-id="${escapeHtml(word.id)}" type="button" aria-label="播放 ${escapeHtml(word.word)} 的发音">🔊</button>
       </article>`;
     }).join("");
+    scheduleAudioPrefetch(words);
   }
 
   function renderUnderstandingList() {
@@ -1008,6 +1013,7 @@
     } else {
       renderStandardTask(task);
     }
+    scheduleAudioPrefetch((task.items || []).map((item) => ({ word: item.audioText })).filter((item) => item.word));
     renderAnswerKeyPanel(task);
     renderStudentTaskResult();
   }
@@ -1087,6 +1093,8 @@
 
   async function selectWord(wordId) {
     if (session.role !== "teacher") return;
+    const word = (session.state.words || []).find((item) => item.id === wordId);
+    if (word) scheduleAudioPrefetch([word]);
     await performAction("setWord", { wordId });
   }
 
@@ -1098,6 +1106,7 @@
     if (!next) return null;
     session.state.activeWordId = next.id;
     renderAll();
+    scheduleAudioPrefetch([next]);
     try {
       await sendAction("setWord", { wordId: next.id }, false);
     } catch (error) {
@@ -1132,12 +1141,101 @@
     if (tile && session.role === "teacher") selectWord(tile.dataset.wordId);
   }
 
+  function wordAudioSource(text) {
+    return location.protocol === "file:"
+      ? `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(text)}&type=2`
+      : `/api/audio?word=${encodeURIComponent(text)}`;
+  }
+
+  function cachedWordAudio(text) {
+    const normalized = String(text || "").trim();
+    const key = normalized.toLowerCase();
+    if (!key) return null;
+    let entry = session.audioCache.get(key);
+    if (entry) return entry;
+    const audio = new Audio(wordAudioSource(normalized));
+    audio.preload = "auto";
+    audio.volume = 1;
+    audio.muted = false;
+    audio.playsInline = true;
+    entry = { audio, ready: false, failed: false };
+    const markReady = () => {
+      entry.ready = true;
+      entry.failed = false;
+    };
+    audio.addEventListener("loadeddata", markReady, { once: true });
+    audio.addEventListener("canplaythrough", markReady, { once: true });
+    audio.addEventListener("error", () => {
+      entry.ready = false;
+      entry.failed = true;
+    });
+    session.audioCache.set(key, entry);
+    audio.load();
+    return entry;
+  }
+
+  function scheduleAudioPrefetch(words) {
+    const unique = [];
+    const seen = new Set();
+    (words || []).forEach((item) => {
+      const text = String(typeof item === "string" ? item : item?.word || "").trim();
+      const key = text.toLowerCase();
+      if (!text || seen.has(key)) return;
+      seen.add(key);
+      unique.push(text);
+    });
+    if (!unique.length) return;
+    const activeText = String(currentWord()?.word || "").trim().toLowerCase();
+    const activeIndex = unique.findIndex((text) => text.toLowerCase() === activeText);
+    if (activeIndex > 0) unique.unshift(unique.splice(activeIndex, 1)[0]);
+    if (session.audioPrefetchTimer) window.clearTimeout(session.audioPrefetchTimer);
+    const runId = session.audioPrefetchRun + 1;
+    session.audioPrefetchRun = runId;
+    session.audioPrefetchTimer = window.setTimeout(() => {
+      session.audioPrefetchTimer = null;
+      warmAudioCache(unique, runId);
+    }, 80);
+  }
+
+  function warmAudioCache(words, runId) {
+    let index = 0;
+    let active = 0;
+    const pump = () => {
+      if (runId !== session.audioPrefetchRun) return;
+      while (active < 4 && index < words.length) {
+        const entry = cachedWordAudio(words[index]);
+        index += 1;
+        if (!entry) continue;
+        if (entry.ready) continue;
+        active += 1;
+        let done = false;
+        const next = () => {
+          if (done) return;
+          done = true;
+          active = Math.max(0, active - 1);
+          pump();
+        };
+        entry.audio.addEventListener("canplaythrough", next, { once: true });
+        entry.audio.addEventListener("error", next, { once: true });
+        window.setTimeout(next, 4000);
+      }
+    };
+    pump();
+  }
+
   function playRemoteAudio(text, { waitForEnd = true, onStart } = {}) {
     return new Promise((resolve, reject) => {
-      const source = location.protocol === "file:"
-        ? `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(text)}&type=2`
-        : `/api/audio?word=${encodeURIComponent(text)}`;
-      const audio = new Audio(source);
+      const entry = cachedWordAudio(text);
+      if (!entry) {
+        reject(new Error("单词无效"));
+        return;
+      }
+      if (entry.failed) {
+        entry.failed = false;
+        entry.audio.src = wordAudioSource(text);
+        entry.audio.load();
+      }
+      const audio = entry.audio;
       audio.preload = "auto";
       audio.volume = 1;
       audio.muted = false;
@@ -1157,6 +1255,8 @@
       const start = () => {
         if (started) return;
         started = true;
+        entry.ready = true;
+        entry.failed = false;
         clearStartTimer();
         if (typeof onStart === "function") onStart();
         if (!waitForEnd) {
@@ -1173,7 +1273,12 @@
         if (session.activeAudio === audio) session.activeAudio = null;
         resolve(true);
       };
-      audio.onerror = () => fail(new Error("音频播放失败"));
+      audio.onerror = () => {
+        entry.ready = false;
+        entry.failed = true;
+        fail(new Error("音频播放失败"));
+      };
+      try { audio.currentTime = 0; } catch (error) { console.warn(error); }
       startTimer = setTimeout(() => fail(new Error("音频加载超时")), 2500);
       audio.play().catch(fail);
     });
@@ -1197,20 +1302,20 @@
       const voices = speechVoices();
       if (voices.length) utterance.voice = voices.find((voice) => /US|United States/i.test(voice.name)) || voices[0];
       let settled = false;
-      const finish = () => {
+      const finish = (ok = true) => {
         if (settled) return;
         settled = true;
-        resolve(true);
+        resolve(ok);
       };
       utterance.onstart = () => {
         if (typeof onStart === "function") onStart();
-        if (!waitForEnd) finish();
+        if (!waitForEnd) finish(true);
       };
-      utterance.onend = finish;
-      utterance.onerror = finish;
+      utterance.onend = () => finish(true);
+      utterance.onerror = () => finish(false);
       window.speechSynthesis.resume();
       window.speechSynthesis.speak(utterance);
-      setTimeout(finish, waitForEnd ? 4500 : 1400);
+      setTimeout(() => finish(true), waitForEnd ? 4500 : 1400);
     });
   }
 
@@ -1221,11 +1326,23 @@
       session.activeAudio.pause();
       session.activeAudio = null;
     }
+    const entry = cachedWordAudio(text);
+    if (entry?.ready) {
+      try {
+        return await playRemoteAudio(text, options);
+      } catch (error) {
+        console.warn("缓存发音播放失败，改用浏览器语音", error);
+      }
+    }
+    if ("speechSynthesis" in window) {
+      const spoken = await playBrowserSpeech(text, options);
+      if (spoken) return true;
+    }
     try {
       return await playRemoteAudio(text, options);
     } catch (error) {
-      console.warn("在线发音不可用，改用浏览器语音", error);
-      return playBrowserSpeech(text, options);
+      console.warn("在线发音不可用", error);
+      return false;
     }
   }
 
